@@ -218,6 +218,9 @@ const App=()=>{
             _totalVND:payload.snapshot?.totalVND||0,
             _totalKg:payload.snapshot?.totalKg||0,
             _approvals:Array.isArray(payload.approvals)?payload.approvals:[],
+            _products:Array.isArray(payload.products)?payload.products:[],
+            _exchangeRate:payload.inputs?(parseFloat(payload.inputs.exchangeRate)||0):0,
+            _cfWeek:(payload.cfMode==='manual'&&payload.cfManualWeek)?payload.cfManualWeek:null,
           };
         }catch(e){
           return{...f,_status:'error',_requestedBy:'?',_requestNote:'(không đọc được nội dung)'};
@@ -2098,7 +2101,23 @@ URL.revokeObjectURL(url);
                   </div>
                   {ceoOpen['pa:'+f.name]&&(
                     <div style={{marginTop:5,background:'#f8fafc',borderRadius:7,padding:'7px 9px'}}>
-                      <div style={{fontSize:'.62rem',fontWeight:700,color:'#475569'}}>Lưu lúc: {f._savedAt?new Date(f._savedAt).toLocaleString('vi-VN'):'?'} · {fv(f._totalKg)} kg · {(f._totalVND/1e9).toFixed(3)} tỷ</div>
+                      <div style={{fontSize:'.62rem',fontWeight:700,color:'#475569'}}>Lưu lúc: {f._savedAt?new Date(f._savedAt).toLocaleString('vi-VN'):'?'} · {fv(f._totalKg)} kg · {(f._totalVND/1e9).toFixed(3)} tỷ{f._cfWeek?<> · 🚢 Cont về: <b>{f._cfWeek}</b></>:null}{f._exchangeRate>0?` · Tỷ giá ${fv(f._exchangeRate)}`:''}</div>
+                      {(f._products||[]).length>0&&(
+                        <table style={{width:'100%',marginTop:5,fontSize:'.62rem',fontWeight:700,borderCollapse:'collapse'}}>
+                          <thead><tr style={{color:'#94a3b8',textAlign:'right'}}><td style={{textAlign:'left'}}>MUA GÌ ({f._products.length} SKU)</td><td>KL kg</td><td>CIF $/t</td><td>Thành tiền</td></tr></thead>
+                          <tbody>{f._products.map((p,k)=>{
+                            const usd=(parseFloat(p.qtyKg)||0)/1000*(parseFloat(p.priceFC)||0);
+                            return (
+                              <tr key={k} style={{borderTop:'1px solid #e2e8f0',textAlign:'right'}}>
+                                <td style={{textAlign:'left',padding:'3px 0',fontWeight:800,color:'#0f172a'}}>{skuLabel(p)}</td>
+                                <td className="mono">{fv(p.qtyKg)}</td>
+                                <td className="mono">{fv(p.priceFC)}</td>
+                                <td className="mono" style={{fontWeight:800}}>{f._exchangeRate>0?fv(usd*f._exchangeRate/1e6)+' tr':fu(usd)}</td>
+                              </tr>
+                            );
+                          })}</tbody>
+                        </table>
+                      )}
                       {(f._approvals||[]).length>0?(f._approvals||[]).map((a,j)=>(
                         <div key={j} style={{fontSize:'.62rem',fontWeight:700,color:'#334155',borderTop:j>0?'1px solid #e2e8f0':'none',marginTop:3,paddingTop:3}}>
                           {a.decision==='rejected'?'✗':'✓'} <b>{a.name}</b> ({a.role} · bước {a.step}) — {a.at?new Date(a.at).toLocaleString('vi-VN'):''}
