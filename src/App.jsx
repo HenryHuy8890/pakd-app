@@ -60,6 +60,9 @@ const App=()=>{
   const [ghVerifying,setGhVerifying]=useState(false);
   const [ghUser,setGhUser]=useState(null); // {login, name}
   const [ghBlockedScreen,setGhBlockedScreen]=useState(true); // hiển thị màn login lần đầu
+  // ── GĐ2: cấu hình Google Apps Script (ghi 2 chiều GSheet) ──
+  const [gasConfig,setGasConfig]=useState(()=>{try{return JSON.parse(localStorage.getItem('pakd_gas_config')||'{}');}catch(e){return{};}});
+  const saveGasConfig=(cfg)=>{setGasConfig(cfg);try{localStorage.setItem('pakd_gas_config',JSON.stringify(cfg));}catch(e){}};
   // Ref để các useCallback luôn đọc giá trị mới nhất (tránh stale closure)
   const ghVerifiedRef=useRef(false);
   useEffect(()=>{ghVerifiedRef.current=ghVerified;},[ghVerified]);
@@ -509,6 +512,28 @@ const App=()=>{
       return false;
     }
   },[approvers,loadApprovers,sha256,ghAPI,ghConfig.branch,listPAsFromGithub]);
+
+  // ═══ GĐ2: GHI 2 CHIỀU GSHEET (qua Google Apps Script Web App) ═══
+  // Mọi thao tác ghi: nhập PIN định danh người làm; Apps Script lưu vết giá trị cũ→mới vào tab AUDIT_LOG.
+  const gasCall=useCallback(async(action,payload,by)=>{
+    if(!gasConfig.url){alert('⚠ Chưa cấu hình Apps Script.\nMở ⚙️ GitHub → mục "📝 Ghi GSheet (Apps Script)".');return null;}
+    try{
+      const res=await fetch(gasConfig.url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({secret:gasConfig.secret||'',action,by,payload})});
+      const data=await res.json();
+      if(!data.ok){alert('❌ GSheet từ chối:\n'+(data.error||'?'));return null;}
+      return data;
+    }catch(e){alert('❌ Lỗi gọi Apps Script:\n'+e.message);return null;}
+  },[gasConfig]);
+  // Nhập PIN → trả về người duyệt tương ứng (định danh người ghi GSheet)
+  const identifyByPin=useCallback(async(message)=>{
+    const pin=await askPin(message||'🔐 Nhập PIN của bạn để ghi vào GSheet (định danh + lưu vết):');
+    if(pin===null) return null;
+    const apList=approvers.length?approvers:await loadApprovers();
+    if(!apList.length){alert('⚠ Chưa có danh sách người duyệt — vào ⚙️ GitHub → Quản lý người duyệt.');return null;}
+    const me=await findByPin(apList,pin);
+    if(!me){alert('❌ PIN không khớp người duyệt nào.');return null;}
+    return me;
+  },[approvers,loadApprovers,askPin]);
   // Ghi danh sách người duyệt lên GitHub
   const saveApprovers=useCallback(async(list)=>{
     const payload={version:1,updatedAt:new Date().toISOString(),approvers:list};
@@ -1255,6 +1280,43 @@ const App=()=>{
     });
     return out;
   },[inventory,poByKey,poTotalRemaining]);
+
+  // ── GĐ2: "✓ Đã xử lý" đề xuất mua (tab Min/Max) — xóa ô yêu cầu mua trên GSheet, có PIN + lưu vết ──
+  const handleMarkBuyReqDone=useCallback(async(r)=>{
+    if(!window.confirm(`ĐÃ XỬ LÝ đề xuất mua?\n${skuLabel(r)} — yêu cầu: ${r.buyRequest}${r.buyRequestWeek?' ('+r.buyRequestWeek+')':''}\n\nÔ "yêu cầu mua" trên GSheet sẽ bị XÓA (giá trị cũ lưu vết ở tab AUDIT_LOG).`)) return;
+    const me=await identifyByPin();
+    if(!me) return;
+    const res=await gasCall('markBuyReqDone',{alloy:r.alloy,temper:r.temper,thickness:r.thickness,width:r.width,length:r.length,coating:r.coating},me.name);
+    if(res){alert(`✓ ${res.msg}\nNgười xử lý: ${me.name} (đã lưu vết).`);syncGoogleSheet('ms');}
+  },[identifyByPin,gasCall,syncGoogleSheet]);
+  // ── GĐ2: cập nhật TL đã giao của 1 dòng PO ngay trong app ──
+  const handleUpdatePODelivered=useCallback(async(p)=>{
+    const raw=window.prompt(`PO ${p.po} — ${skuLabel(p)}\nTL đặt: ${fv(p.ordered)} kg · Đã giao: ${fv(p.delivered)} kg\n\nNhập TL ĐÃ GIAO mới (kg):`,String(p.delivered||0));
+    if(raw===null) return;
+    const val=pn(raw);
+    if(val<0){alert('❌ Số không hợp lệ');return;}
+    if(p.ordered>0&&val>p.ordered){alert(`❌ TL đã giao (${fv(val)}) lớn hơn TL đặt (${fv(p.ordered)})`);return;}
+    const me=await identifyByPin();
+    if(!me) return;
+    const res=await gasCall('updatePODelivered',{po:p.po,alloy:p.alloy,temper:p.temper,thickness:p.thickness,width:p.width,length:p.length,coating:p.coating,delivered:val},me.name);
+    if(res){alert(`✓ ${res.msg}\nNgười cập nhật: ${me.name} (đã lưu vết).`);syncGoogleSheet('po');}
+  },[identifyByPin,gasCall,syncGoogleSheet]);
+  // ── GĐ2: 1 click tạo PA Mua từ các SKU PO đang thiếu (Cần đặt thêm > 0), gộp theo SKU ──
+  const createPAFromShortPO=useCallback(()=>{
+    const short={};
+    poEnriched.forEach(p=>{if(p.needBuy>0){if(!short[p.key])short[p.key]={...p,needBuyTotal:0};short[p.key].needBuyTotal+=p.needBuy;}});
+    const skus=Object.values(short);
+    if(skus.length===0){alert('✓ Không có SKU nào đang thiếu — kho + đang về đã đáp ứng đủ PO.');return;}
+    if(!window.confirm(`Tạo PA Mua từ ${skus.length} SKU đang thiếu (tổng ${fv(skus.reduce((s,p)=>s+p.needBuyTotal,0))} kg)?\n\nLưu ý: danh sách SKU ở tab PAKD Mua hiện tại sẽ bị THAY THẾ.`)) return;
+    const newProducts=skus.map((p,i)=>{
+      const uip=findUpdatedImportPrice(p,updatedImportPrices,inputs.exchangeRate);
+      return {id:uid()+i,alloy:p.alloy,temper:p.temper,thickness:p.thickness,width:p.width,length:p.length,coating:p.coating,qtyKg:Math.round(p.needBuyTotal),priceFC:uip?uip.priceFC:0};
+    });
+    setProducts(newProducts);
+    setTab('main');
+    const noPrice=newProducts.filter(p=>!p.priceFC).length;
+    alert(`✓ Đã đưa ${newProducts.length} SKU sang tab PAKD Mua.${noPrice?`\n⚠ ${noPrice} mã chưa có giá CIF cập nhật (giá=0) — anh nhập tay.`:''}`);
+  },[poEnriched,updatedImportPrices,inputs.exchangeRate]);
 
   const floorPriceData=useMemo(()=>{
     const skuGroups=groupBySku(inventory);
@@ -2545,7 +2607,7 @@ URL.revokeObjectURL(url);
                         </td>
                         <td style={{textAlign:'center',width:90}}>{ratio!==null?(<div><div className="stock-bar" style={{height:5,margin:'0 8px 2px'}}><div className="stock-bar-fill" style={{width:`${Math.min((ratio/2.5)*100,100)}%`,background:isOver?'#6d28d9':ratio<0.8?'#dc2626':ratio<1?'#d97706':ratio>2?'#4f46e5':'#16a34a'}}/></div><span className="mono" style={{fontSize:'.72rem',fontWeight:800,color:isOver?'#6d28d9':ratio<0.8?'#dc2626':ratio<1?'#d97706':ratio>2?'#4f46e5':'#16a34a'}}>{Math.round(ratio*100)}%</span></div>):<span style={{color:'#64748b'}}>—</span>}</td>
                         <td style={{textAlign:'right',paddingRight:9,width:155}}>{isOver?(<span className="mono" style={{fontSize:'.78rem',fontWeight:800,color:'#6d28d9'}}>▲ quá max +{fv(curQty-mx)} kg</span>):delta!=null?(<span className="mono" style={{fontSize:'.78rem',fontWeight:800,color:delta>=0?'#15803d':'#b91c1c'}}>{delta>=0?'▲ dư +':'▼ thiếu '}{fv(Math.abs(delta))} kg</span>):<span style={{color:'#64748b'}}>—</span>}</td>
-                        <td style={{textAlign:'center',background:hasReq?'#fef3c7':'transparent'}}>{hasReq?<span style={{fontSize:'.82rem',fontWeight:900,color:'#92400e'}}>🛒 {r.buyRequest}</span>:<span style={{color:'#cbd5e1',fontSize:'.7rem'}}>—</span>}</td>
+                        <td style={{textAlign:'center',background:hasReq?'#fef3c7':'transparent'}}>{hasReq?<span style={{fontSize:'.82rem',fontWeight:900,color:'#92400e'}}>🛒 {r.buyRequest}{gasConfig.url&&<button onClick={()=>handleMarkBuyReqDone(r)} title="✓ ĐÃ XỬ LÝ — xóa đề xuất trên GSheet (cần PIN, có lưu vết AUDIT_LOG)" style={{marginLeft:6,border:'1px solid #16a34a',background:'#f0fdf4',color:'#15803d',borderRadius:4,cursor:'pointer',fontSize:'.66rem',fontWeight:800,padding:'1px 6px'}}>✓ Xử lý</button>}</span>:<span style={{color:'#cbd5e1',fontSize:'.7rem'}}>—</span>}</td>
                         <td style={{textAlign:'center',background:hasReq?'#fef3c7':'transparent'}}>{r.buyRequestWeek?<span style={{fontSize:'.78rem',fontWeight:800,color:'#b45309'}}>{r.buyRequestWeek}</span>:<span style={{color:'#cbd5e1',fontSize:'.7rem'}}>—</span>}</td>
                         <td><button className="btn-danger" onClick={()=>delMS(r.id)}><Ic.X/></button></td>
                       </tr>
@@ -3791,6 +3853,7 @@ URL.revokeObjectURL(url);
                 </div>
                 <div style={{display:'flex',gap:8,alignItems:'center'}}>
                   <button className="btn btn-ghost btn-sm" onClick={()=>syncGoogleSheet('po')} disabled={dbStatus.loading||!ghVerified}>{dbStatus.loading?<div className="spinner"/>:<Ic.Refresh/>} Sync PO</button>
+                  <button className="btn btn-purple btn-sm" onClick={createPAFromShortPO} disabled={poData.length===0} title="Gộp các SKU 'Cần đặt thêm' (kho + đang về không đủ giao PO) thành danh sách SKU bên tab PAKD Mua">🛒 Tạo PA Mua từ SKU thiếu</button>
                   {poData.length===0?<span className="tag tr pulse">⚠ Chưa có dữ liệu – nhấn Sync</span>:<span className="tag tg">✓ {poData.length} dòng PO</span>}
                 </div>
               </div>
@@ -3847,7 +3910,7 @@ URL.revokeObjectURL(url);
                                 {/* SỬA #2 (R7): Đơn giá bán cho khách (cột Đơn giá trong sheet PO) */}
                                 <td className="mono" style={{textAlign:'right',fontWeight:900,color:p.price>0?'#047857':'#cbd5e1',background:'#f0fdf4'}}>{p.price>0?fv(p.price):'—'}</td>
                                 <td className="mono" style={{textAlign:'right'}}>{fv(p.ordered)}</td>
-                                <td className="mono" style={{textAlign:'right',color:'#15803d'}}>{fv(p.delivered)}</td>
+                                <td className="mono" style={{textAlign:'right',color:'#15803d'}}>{fv(p.delivered)}{gasConfig.url&&<button onClick={()=>handleUpdatePODelivered(p)} title="Cập nhật TL đã giao vào GSheet (cần PIN, có lưu vết)" style={{marginLeft:5,border:'none',background:'none',cursor:'pointer',fontSize:'.72rem',color:'#2563eb'}}>✎</button>}</td>
                                 <td className="mono" style={{textAlign:'right',fontWeight:800,color:p.remaining>0?'#b45309':'#64748b'}}>{fv(p.remaining)}</td>
                                 <td className="mono" style={{textAlign:'right',color:'#16a34a'}}>{fv(p.coverStock)}</td>
                                 <td className="mono" style={{textAlign:'right',color:'#d97706'}}>{fv(p.coverTransit)}</td>
@@ -4116,6 +4179,17 @@ URL.revokeObjectURL(url);
                   const ok=await verifyGithubToken(false);
                   if(ok){setGhStatus(p=>({...p,configOpen:false}));}
                 }}>{ghVerifying?'⏳ Đang xác thực...':'💾 Lưu & Xác thực'}</button>
+              </div>
+              {/* GĐ2: Ghi 2 chiều GSheet qua Apps Script */}
+              <div style={{marginTop:14,paddingTop:14,borderTop:'2px dashed #cbd5e1'}}>
+                <div style={{fontSize:'.78rem',fontWeight:900,color:'#0f172a',marginBottom:8}}>📝 Ghi GSheet (Apps Script — GĐ2)</div>
+                <div style={{fontSize:'.7rem',color:'#475569',marginBottom:8,lineHeight:1.5}}>Cho phép app ghi ngược vào GSheet: xử lý đề xuất mua, cập nhật TL đã giao PO. Mọi thao tác cần PIN và được lưu vết ở tab <code style={{background:'#f1f5f9',padding:'1px 4px',borderRadius:3}}>AUDIT_LOG</code>. Cách deploy: xem <code style={{background:'#f1f5f9',padding:'1px 4px',borderRadius:3}}>apps-script/Code.gs</code>.</div>
+                <div><label className="lbl">Web App URL</label><input type="text" className="inp" placeholder="https://script.google.com/macros/s/…/exec" value={gasConfig.url||''} onChange={e=>setGasConfig(p=>({...p,url:e.target.value.trim()}))} style={{fontFamily:'JetBrains Mono',fontSize:'.72rem'}}/></div>
+                <div style={{marginTop:8}}><label className="lbl">Mã bí mật (SECRET)</label><input type="password" className="inp" placeholder="trùng Script properties → SECRET" value={gasConfig.secret||''} onChange={e=>setGasConfig(p=>({...p,secret:e.target.value.trim()}))} style={{fontFamily:'JetBrains Mono',fontSize:'.72rem'}}/></div>
+                <div style={{display:'flex',gap:8,marginTop:8,justifyContent:'flex-end'}}>
+                  <button className="btn btn-ghost btn-sm" onClick={async()=>{const r=await gasCall('ping',{},'test');if(r)alert('✓ '+(r.msg||'Kết nối OK'));}}>📡 Test kết nối</button>
+                  <button className="btn btn-success btn-sm" onClick={()=>{saveGasConfig(gasConfig);alert('✓ Đã lưu cấu hình Apps Script (trong trình duyệt này).');}}>💾 Lưu</button>
+                </div>
               </div>
               {/* Quản lý người duyệt (Việc 1) */}
               <div style={{marginTop:14,paddingTop:14,borderTop:'2px dashed #cbd5e1'}}>
