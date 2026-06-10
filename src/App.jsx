@@ -1,7 +1,7 @@
 import React from 'react';
 const {useState,useEffect,useRef,useMemo,useCallback,Component}=React;
 import Chart from 'chart.js/auto';
-import {ALLOYS,COMBINING,DEFAULT_MGMT_GROUPS,GSHEET_CASHFLOW,GSHEET_FLOOR_HISTORY,GSHEET_INVENTORY,GSHEET_LIMITS,GSHEET_MINSTOCK,GSHEET_PO,GSHEET_UPDATED_IMPORT,LENGTHS,TEMPERS,THICKS,WIDTHS,approvalProgress,findByPin,hashPin,pinMatches,calcFinance,calcInventoryValue,calcFloorPricePerSku,calcInvoice,calcLanded,calcLimitsWarnings,calcMgmtGroups,calcProductBreakdown,calcSkuBlend,coatingFromGSheet,defInputs,defInventory,defLimits,defMinStock,defProducts,defSP,defUpdatedImport,expandWildcardProducts,fetchCsv,fetchText,filterLatestUIP,filterPrevWeekUIP,findUpdatedImportPrice,fu,fv,groupBySku,normThick,parseCsv,parsePOData,parseVNDate,pn,sha256,skuKey,skuKeyNorm,skuLabel,stepOf,stripVN,uid,weightedAvg} from './lib/core';
+import {ALLOYS,COMBINING,DEFAULT_MGMT_GROUPS,GSHEET_CASHFLOW,GSHEET_FLOOR_HISTORY,GSHEET_INVENTORY,GSHEET_LIMITS,GSHEET_MINSTOCK,GSHEET_PO,GSHEET_UPDATED_IMPORT,LENGTHS,TEMPERS,THICKS,WIDTHS,approvalProgress,findByPin,hashPin,pinMatches,calcFinance,calcInventoryValue,calcFloorPricePerSku,calcInvoice,calcLanded,calcMgmtGroups,calcProductBreakdown,calcSkuBlend,coatingFromGSheet,defInputs,defInventory,defLimits,defMinStock,defProducts,defSP,defUpdatedImport,expandWildcardProducts,fetchCsv,fetchText,filterLatestUIP,filterPrevWeekUIP,findUpdatedImportPrice,fu,fv,groupBySku,normThick,parseCsv,parsePOData,parseVNDate,pn,sha256,skuKey,skuKeyNorm,skuLabel,stepOf,stripVN,uid,weightedAvg} from './lib/core';
 import {getCurrentWeekLabel,matchWeekLabel,parseCashFlowCSV} from './lib/cashflow';
 import {FilterBar,Ic,LimitBar,SkuLabelCell,SkuSel} from './components/ui';
 import {CashFlowTab} from './components/CashFlowTab';
@@ -540,6 +540,23 @@ const App=()=>{
     if(!me){alert('❌ PIN không khớp người duyệt nào.');return null;}
     return me;
   },[approvers,loadApprovers,askPin]);
+  // ── R5: cấu hình Apps Script DÙNG CHUNG — đọc /config/gas.json trên repo pakd-data sau khi xác thực.
+  // Trước đây chỉ lưu localStorage máy cấu hình → máy khác mở app không có URL/SECRET, tab Thị trường trống.
+  const gasCfgSyncedRef=useRef(false);
+  useEffect(()=>{
+    if(!ghVerified||gasCfgSyncedRef.current) return;
+    gasCfgSyncedRef.current=true;
+    (async()=>{
+      try{
+        const data=await ghAPI('GET','contents/config/gas.json');
+        const remote=JSON.parse(decodeURIComponent(escape(atob(data.content.replace(/\n/g,'')))));
+        if(remote&&remote.url){
+          setGasConfig({url:remote.url,secret:remote.secret||''});
+          try{localStorage.setItem('pakd_gas_config',JSON.stringify({url:remote.url,secret:remote.secret||''}));}catch(e){}
+        }
+      }catch(e){/* chưa có file gas.json trên repo → dùng cấu hình local nếu có */}
+    })();
+  },[ghVerified,ghAPI]);
 
   // ═══ GĐ3a: GIÁ THỊ TRƯỜNG (LME/SHFE/SMM + tỷ giá) — đọc tab MARKET_PRICES qua Apps Script ═══
   const [marketData,setMarketData]=useState([]);   // rows mới nhất trước: {date,lme_usd,shfe_cny,smm_cny,smm_move,smm_usd,usd_vnd,cny_vnd}
@@ -1351,7 +1368,6 @@ const App=()=>{
   // Sync resultRef cho callbacks GitHub không vi phạm TDZ
   useEffect(()=>{resultRef.current=result;},[result]);
 
-  const limitsWarnings=useMemo(()=>calcLimitsWarnings(limitsData,inventory),[limitsData,inventory]);
 
   // ── PO đã ký: gom tổng "chưa giao" theo SKU key chuẩn hóa ──
   const poByKey=useMemo(()=>{
@@ -2212,7 +2228,6 @@ URL.revokeObjectURL(url);
           {result&&<span className={`tag ${result.rec.cls}`}>{result.rec.txt}</span>}
           {result&&<span className={`tag ${result.containerOk?'tg':result.totalContainer<24?'tr':'ty'}`}>📦 {result.totalContainer.toFixed(1)}T</span>}
           {result&&result.hasLowStock&&<span className="tag tr pulse"><Ic.Alert/> Thiếu hàng</span>}
-          {limitsWarnings.totalAlerts>0&&<span className="tag tr pulse"><Ic.Alert/> {limitsWarnings.totalAlerts} CB</span>}
           <button className="btn btn-success btn-sm" onClick={saveScenario}><Ic.Save/> Lưu</button>
           {/* Cấu hình GitHub chung — dùng cho mọi tính năng cloud (PA, Giá sàn, ...) */}
           <button className="btn btn-ghost btn-sm" onClick={()=>setGhStatus(p=>({...p,configOpen:true}))} title={ghVerified?`✓ GitHub: ${ghUser?.login||'?'} — Click để chỉnh cấu hình`:'Cấu hình kết nối GitHub'} style={{padding:'4px 9px',fontSize:'.72rem',background:ghVerified?'#dcfce7':'#fee2e2',border:`1px solid ${ghVerified?'#86efac':'#fca5a5'}`,color:ghVerified?'#14532d':'#991b1b'}}>
@@ -4174,7 +4189,18 @@ URL.revokeObjectURL(url);
                 <div style={{marginTop:8}}><label className="lbl">Mã bí mật (SECRET)</label><input type="password" className="inp" placeholder="trùng Script properties → SECRET" value={gasConfig.secret||''} onChange={e=>setGasConfig(p=>({...p,secret:e.target.value.trim()}))} style={{fontFamily:'JetBrains Mono',fontSize:'.72rem'}}/></div>
                 <div style={{display:'flex',gap:8,marginTop:8,justifyContent:'flex-end'}}>
                   <button className="btn btn-ghost btn-sm" onClick={async()=>{const r=await gasCall('ping',{},'test');if(r)alert('✓ '+(r.msg||'Kết nối OK'));}}>📡 Test kết nối</button>
-                  <button className="btn btn-success btn-sm" onClick={()=>{saveGasConfig(gasConfig);alert('✓ Đã lưu cấu hình Apps Script (trong trình duyệt này).');}}>💾 Lưu</button>
+                  <button className="btn btn-success btn-sm" onClick={async()=>{
+                    saveGasConfig(gasConfig);
+                    if(ghVerified&&gasConfig.url){
+                      try{
+                        let sha=null;
+                        try{const ex=await ghAPI('GET','contents/config/gas.json');sha=ex.sha;}catch(e){}
+                        const content=btoa(unescape(encodeURIComponent(JSON.stringify({url:gasConfig.url,secret:gasConfig.secret||'',updatedAt:new Date().toISOString()},null,2))));
+                        await ghAPI('PUT','contents/config/gas.json',{message:'Cập nhật cấu hình Apps Script dùng chung',content,branch:ghConfig.branch||'main',...(sha?{sha}:{})});
+                        alert('✓ Đã lưu cấu hình Apps Script DÙNG CHUNG lên GitHub (/config/gas.json).\nMọi thành viên chỉ cần xác thực GitHub là app tự nhận — không phải cấu hình tay.');
+                      }catch(e){alert('✓ Đã lưu trên máy này.\n⚠ Không đẩy được lên GitHub (token thiếu quyền ghi?):\n'+e.message);}
+                    } else alert('✓ Đã lưu cấu hình Apps Script (trong trình duyệt này).');
+                  }}>💾 Lưu dùng chung</button>
                 </div>
               </div>
               {/* Quản lý người duyệt (Việc 1) */}
