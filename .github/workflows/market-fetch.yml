@@ -1,0 +1,66 @@
+# PHƯƠNG ÁN B cho giá thị trường (GĐ3a) — chỉ cần khi Apps Script bị nguồn chặn IP Google.
+# GitHub Actions (IP Microsoft) kéo giá SMM/LME/SHFE + tỷ giá VCB rồi POST vào Apps Script (action=storeMarket).
+# CÁCH BẬT: repo Settings → Secrets and variables → Actions → New secret:
+#   GAS_URL    = URL Web App Apps Script (…/exec)
+#   GAS_SECRET = đúng mã SECRET trong Script properties
+# Có secret là workflow tự chạy 12h05 trưa VN hằng ngày. Không có secret → tự bỏ qua, vô hại.
+name: Fetch market prices (plan B)
+
+on:
+  schedule:
+    - cron: '5 5 * * *'   # 05:05 UTC = 12:05 trưa VN
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch prices & push to Apps Script
+        env:
+          GAS_URL: ${{ secrets.GAS_URL }}
+          GAS_SECRET: ${{ secrets.GAS_SECRET }}
+        run: |
+          if [ -z "$GAS_URL" ]; then echo "Chưa cấu hình GAS_URL — bỏ qua (plan B chưa bật)."; exit 0; fi
+          python3 - <<'EOF'
+          import json, os, re, urllib.request
+
+          def get(url, timeout=30):
+              req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+              return urllib.request.urlopen(req, timeout=timeout).read().decode('utf-8', 'replace')
+
+          def ww(kind):
+              try:
+                  d = json.loads(get(f'https://www.worthwillaluminium.com/api/price/{kind}'))
+                  return d['data']['current'] if d.get('code') == 200 else None
+              except Exception as e:
+                  print(f'✗ {kind}: {e}'); return None
+
+          def num(v):
+              try: return float(str(v).replace(',', ''))
+              except Exception: return None
+
+          smm, lme, shfe = ww('smm'), ww('lme'), ww('shfe')
+          usd = cny = None
+          try:
+              xml = get('https://portal.vietcombank.com.vn/Usercontrols/TVPortal.TyGia/pXML.aspx')
+              pick = lambda c: num((re.search(f'CurrencyCode="{c}"[^/]*Transfer="([\\d.,]+)"', xml) or [None, None])[1])
+              usd, cny = pick('USD'), pick('CNY')
+          except Exception as e:
+              print(f'✗ VCB: {e}')
+
+          payload = {
+              'secret': os.environ['GAS_SECRET'], 'action': 'storeMarket', 'by': 'github-actions',
+              'payload': {
+                  'smm': num(smm and smm.get('average')), 'smmMove': num(smm and smm.get('move')),
+                  'lme': num(lme and (lme.get('average') or lme.get('end'))),
+                  'shfe': num(shfe and (shfe.get('close_price') or shfe.get('settlement_price'))),
+                  'usd': usd, 'cny': cny,
+              },
+          }
+          print('Giá lấy được:', {k: v for k, v in payload['payload'].items()})
+          req = urllib.request.Request(os.environ['GAS_URL'], data=json.dumps(payload).encode(),
+                                       headers={'Content-Type': 'text/plain;charset=utf-8'})
+          resp = urllib.request.urlopen(req, timeout=60).read().decode()
+          print('Apps Script trả về:', resp)
+          assert '"ok":true' in resp.replace(' ', ''), 'Apps Script báo lỗi!'
+          EOF
