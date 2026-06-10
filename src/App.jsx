@@ -547,14 +547,47 @@ const App=()=>{
     }catch(e){setMarketErr(e.message);}
   },[gasConfig.url,gasConfig.secret]);
   useEffect(()=>{loadMarket();},[loadMarket]);
-  // R2: KHÔNG dùng premium chung — premium động suy từ lịch sử CIF của TỪNG quy cách [Mác|Temper|Dải dày].
-  const [marketAlloy,setMarketAlloy]=useState('ALL'); // filter mác ở tab Thị trường
+  // R3: premium động per quy cách + lọc thời gian + SMM trừ VAT + thống kê & dự phóng
+  const [marketAlloy,setMarketAlloy]=useState('ALL');
+  const [marketRange,setMarketRange]=useState({preset:'90',from:'',to:''}); // preset: 30|90|180|ALL|custom
+  const [smmExVat,setSmmExVat]=useState(true); // SMM A00 gồm 13% VAT nội địa TQ — trừ ra để so chuẩn với LME/CIF xuất khẩu
   const marketChartRef=useRef(null);const marketChartInst=useRef(null);
-  // Premium từng quy cách: premium_i = CIF đợt i − SMM quy đổi USD tại ngày đợt đó
+  const smmFactor=smmExVat?1/1.13:1;
+  // Dòng giá tăng dần theo ngày, lọc theo khoảng thời gian đang chọn
+  const marketRows=useMemo(()=>{
+    const rows=[...marketData].slice().reverse();
+    if(!rows.length) return [];
+    let from='',to='';
+    if(marketRange.preset==='custom'){from=marketRange.from;to=marketRange.to;}
+    else if(marketRange.preset!=='ALL'){
+      const d=new Date(Date.now()-parseInt(marketRange.preset)*86400000);
+      from=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    }
+    return rows.filter(r=>{const d=String(r.date).slice(0,10);return (!from||d>=from)&&(!to||d<=to);});
+  },[marketData,marketRange]);
+  // Thống kê & dự phóng trên chuỗi SMM USD (đã áp trừ VAT nếu bật)
+  const marketStats=useMemo(()=>{
+    const vs=marketRows.map(r=>{const f=parseFloat(r.smm_usd);return isNaN(f)?null:f*smmFactor;}).filter(v=>v!=null);
+    if(vs.length<5) return null;
+    const last=vs[vs.length-1];
+    const at=n=>vs.length>n?vs[vs.length-1-n]:null;
+    const pctf=(a,b)=>(a!=null&&b)?(a-b)/b*100:null;
+    const min=Math.min(...vs),max=Math.max(...vs);
+    const sma=n=>{const s=vs.slice(-Math.min(n,vs.length));return s.reduce((a,b)=>a+b,0)/s.length;};
+    const w=vs.slice(-30);const n=w.length;
+    const xm=(n-1)/2,ym=w.reduce((a,b)=>a+b,0)/n;
+    let nu=0,de=0;w.forEach((y,i)=>{nu+=(i-xm)*(y-ym);de+=(i-xm)*(i-xm);});
+    const slope=de?nu/de:0;const intercept=ym-slope*xm;
+    const sd=Math.sqrt(w.map((y,i)=>y-(intercept+slope*i)).reduce((a,b)=>a+b*b,0)/n);
+    return {last,d7:pctf(last,at(7)),d30:pctf(last,at(30)),min,max,
+            pos:max>min?(last-min)/(max-min)*100:50,sma7:sma(7),sma30:sma(30),
+            slopeW:slope*7,f7:intercept+slope*(n-1+7),sd,n};
+  },[marketRows,smmFactor]);
+  // Premium từng quy cách (dùng TOÀN BỘ lịch sử, không phụ thuộc bộ lọc thời gian)
   const marketPremiumStats=useMemo(()=>{
     if(!marketData.length||!allRawImportPrices.length) return [];
-    const rows=[...marketData].slice().reverse(); // cũ → mới
-    const smmByDate=rows.map(r=>({d:String(r.date).slice(0,10),v:parseFloat(r.smm_usd)||null})).filter(x=>x.v);
+    const rows=[...marketData].slice().reverse();
+    const smmByDate=rows.map(r=>{const f=parseFloat(r.smm_usd);return {d:String(r.date).slice(0,10),v:isNaN(f)?null:f*smmFactor};}).filter(x=>x.v);
     if(!smmByDate.length) return [];
     const smmAt=(iso)=>{let best=null;for(const x of smmByDate){if(x.d<=iso)best=x.v;else break;}return best!=null?best:smmByDate[0].v;};
     const smmNow=smmByDate[smmByDate.length-1].v;
@@ -577,16 +610,17 @@ const App=()=>{
       return {...g,n:g.entries.length,lastDate:lastE.iso,lastCIF:lastE.cif,premAvg,premLast,
               refCIF:(smmNow!=null&&premAvg!=null)?smmNow+premAvg:null,smmNow};
     }).sort((a,b)=>a.alloy.localeCompare(b.alloy)||a.temper.localeCompare(b.temper)||a.range.localeCompare(b.range));
-  },[marketData,allRawImportPrices]);
-  // Vẽ biểu đồ đường SMM/LME/SHFE (quy USD/t) + điểm CIF lịch sử của mác đang lọc
+  },[marketData,allRawImportPrices,smmFactor]);
+  // Vẽ biểu đồ: SMM/LME/SHFE quy USD + SMA30 + điểm CIF của mác đang lọc (trong khoảng thời gian chọn)
   useEffect(()=>{
     if(tab!=='market'||!marketChartRef.current) return;
-    if(typeof Chart==='undefined'||!marketData.length) return;
+    if(typeof Chart==='undefined'||!marketRows.length) return;
     try{
-      const rows=[...marketData].slice().reverse();
       const num=v=>{const f=parseFloat(v);return isNaN(f)?null:f;};
-      const labels=rows.map(r=>String(r.date).slice(0,10));
-      const shfeUsd=rows.map(r=>{const s=num(r.shfe_cny),u=num(r.usd_vnd),c=num(r.cny_vnd);return (s&&u&&c)?Math.round(s*c/u*10)/10:null;});
+      const labels=marketRows.map(r=>String(r.date).slice(0,10));
+      const smmArr=marketRows.map(r=>{const f=num(r.smm_usd);return f!=null?Math.round(f*smmFactor*10)/10:null;});
+      const shfeUsd=marketRows.map(r=>{const s=num(r.shfe_cny),u=num(r.usd_vnd),c=num(r.cny_vnd);return (s&&u&&c)?Math.round(s*c/u*smmFactor*10)/10:null;});
+      const sma30=smmArr.map((_,i)=>{const w=smmArr.slice(Math.max(0,i-29),i+1).filter(v=>v!=null);return w.length>=5?Math.round(w.reduce((a,b)=>a+b,0)/w.length*10)/10:null;});
       const cifPoints=[];
       allRawImportPrices.forEach(u=>{
         if(marketAlloy!=='ALL'&&u.alloy!==marketAlloy) return;
@@ -596,15 +630,16 @@ const App=()=>{
         const iso=`${dd.getFullYear()}-${String(dd.getMonth()+1).padStart(2,'0')}-${String(dd.getDate()).padStart(2,'0')}`;
         let lbl=labels.includes(iso)?iso:null;
         if(!lbl){for(let i=labels.length-1;i>=0;i--){if(labels[i]<=iso){lbl=labels[i];break;}}}
-        if(!lbl)lbl=labels[0];
+        if(!lbl) return; // ngoài khoảng thời gian đang xem
         cifPoints.push({x:lbl,y:cif,spec:`${u.alloy} ${u.temper} ${u.minThick}-${u.maxThick}mm · ${u.updateDate}`});
       });
       if(marketChartInst.current) marketChartInst.current.destroy();
       marketChartInst.current=new Chart(marketChartRef.current.getContext('2d'),{type:'line',
         data:{labels,datasets:[
-          {label:'SMM A00 quy đổi ($/t)',data:rows.map(r=>num(r.smm_usd)),borderColor:'#dc2626',backgroundColor:'#dc2626',borderWidth:2,pointRadius:0,spanGaps:true,tension:.25},
-          {label:'LME cash ($/t)',data:rows.map(r=>num(r.lme_usd)),borderColor:'#2563eb',backgroundColor:'#2563eb',borderWidth:2,pointRadius:0,spanGaps:true,tension:.25},
-          {label:'SHFE quy đổi ($/t)',data:shfeUsd,borderColor:'#d97706',backgroundColor:'#d97706',borderWidth:1.5,borderDash:[5,4],pointRadius:0,spanGaps:true,tension:.25},
+          {label:`SMM A00${smmExVat?' (trừ VAT)':''} $/t`,data:smmArr,borderColor:'#dc2626',backgroundColor:'#dc2626',borderWidth:2,pointRadius:0,spanGaps:true,tension:.25},
+          {label:'SMA30 của SMM',data:sma30,borderColor:'#9ca3af',backgroundColor:'#9ca3af',borderWidth:1.5,borderDash:[3,3],pointRadius:0,spanGaps:true,tension:.25},
+          {label:'LME cash $/t',data:marketRows.map(r=>num(r.lme_usd)),borderColor:'#2563eb',backgroundColor:'#2563eb',borderWidth:2,pointRadius:0,spanGaps:true,tension:.25},
+          {label:`SHFE quy đổi${smmExVat?' (trừ VAT)':''} $/t`,data:shfeUsd,borderColor:'#d97706',backgroundColor:'#d97706',borderWidth:1.5,borderDash:[6,4],pointRadius:0,spanGaps:true,tension:.25},
           {label:`CIF mua thực tế${marketAlloy!=='ALL'?` (${marketAlloy})`:''}`,data:cifPoints,showLine:false,pointRadius:5,pointHoverRadius:7,pointStyle:'rectRot',borderColor:'#16a34a',backgroundColor:'#16a34a'},
         ]},
         options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'nearest',intersect:false},
@@ -612,7 +647,7 @@ const App=()=>{
             tooltip:{callbacks:{label:c=>c.raw&&c.raw.spec?`CIF ${fv(c.raw.y)} $/t — ${c.raw.spec}`:`${c.dataset.label}: ${fv(c.parsed.y)} $/t`}}},
           scales:{x:{ticks:{font:{size:9},maxTicksLimit:14}},y:{ticks:{font:{size:9},callback:v=>fv(v)},title:{display:true,text:'USD/tấn',font:{size:10}}}}}});
     }catch(err){console.error('Lỗi vẽ biểu đồ thị trường:',err);}
-  },[tab,marketData,allRawImportPrices,marketAlloy]);
+  },[tab,marketRows,allRawImportPrices,marketAlloy,smmFactor,smmExVat]);
   // Ghi danh sách người duyệt lên GitHub
   const saveApprovers=useCallback(async(list)=>{
     const payload={version:1,updatedAt:new Date().toISOString(),approvers:list};
@@ -3187,7 +3222,7 @@ URL.revokeObjectURL(url);
               <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:12,flexWrap:'wrap',gap:8}}>
                 <div>
                   <h2 style={{fontWeight:900,fontSize:'1.05rem',color:'#0f172a'}}>📈 Thị trường & Lịch sử CIF</h2>
-                  <p style={{fontSize:'.72rem',color:'#475569',fontWeight:600,marginTop:2}}>SMM A00 · LME · SHFE quy về USD/tấn + các đợt CIF phòng mua đã nhập — khoảng hở SMM↔CIF = premium NCC đang tính</p>
+                  <p style={{fontSize:'.72rem',color:'#475569',fontWeight:600,marginTop:2}}>SMM A00 · LME · SHFE quy về USD/tấn + các đợt CIF phòng mua — khoảng hở SMM↔CIF = premium NCC đang tính</p>
                 </div>
                 <div style={{display:'flex',gap:8,alignItems:'center'}}>
                   {marketData[0]&&<span className="tag tg" style={{fontSize:'.66rem'}}>✓ Giá ngày {marketData[0].date}</span>}
@@ -3199,7 +3234,7 @@ URL.revokeObjectURL(url);
                 <div className="card" style={{textAlign:'center',padding:44}}>
                   <div style={{fontSize:'2rem',marginBottom:8}}>📈</div>
                   <div style={{color:'#64748b',fontWeight:700}}>{marketErr?`⚠ Lỗi đọc giá: ${marketErr}`:'Chưa có dữ liệu giá thị trường'}</div>
-                  <div style={{color:'#94a3b8',fontSize:'.75rem',marginTop:4}}>Trong Apps Script chạy <strong>fetchMarketPrices</strong> (giá hôm nay) và <strong>backfillMarketHistory</strong> (nạp lịch sử các ngày trước) rồi bấm Tải lại.</div>
+                  <div style={{color:'#94a3b8',fontSize:'.75rem',marginTop:4}}>Trong Apps Script chạy <strong>fetchMarketPrices</strong> (giá hôm nay) và <strong>backfillMarketHistory</strong> (lịch sử + tỷ giá lịch sử) rồi bấm Tải lại.</div>
                 </div>
               ):(
                 <>
@@ -3211,7 +3246,7 @@ URL.revokeObjectURL(url);
                       <div style={{display:'flex',gap:10,flexWrap:'wrap',marginBottom:12}}>
                         {[
                           {l:'SMM A00',v:num(mk.smm_cny),u:'¥/t',p:mkPrev&&num(mkPrev.smm_cny)},
-                          {l:'SMM quy đổi',v:num(mk.smm_usd),u:'$/t',p:mkPrev&&num(mkPrev.smm_usd)},
+                          {l:smmExVat?'SMM $/t (trừ VAT)':'SMM $/t (gồm VAT)',v:num(mk.smm_usd)!=null?num(mk.smm_usd)*smmFactor:null,u:'$/t',p:mkPrev&&num(mkPrev.smm_usd)!=null?num(mkPrev.smm_usd)*smmFactor:null},
                           {l:'LME cash',v:num(mk.lme_usd),u:'$/t',p:mkPrev&&num(mkPrev.lme_usd)},
                           {l:'SHFE',v:num(mk.shfe_cny),u:'¥/t',p:mkPrev&&num(mkPrev.shfe_cny)},
                           {l:'USD/VND',v:num(mk.usd_vnd),u:'',p:mkPrev&&num(mkPrev.usd_vnd)},
@@ -3226,45 +3261,87 @@ URL.revokeObjectURL(url);
                     );
                   })()}
 
-                  <div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:10,alignItems:'center'}}>
-                    <span style={{fontSize:'.68rem',fontWeight:800,color:'#475569'}}>Lọc CIF theo mác:</span>
-                    {['ALL',...new Set(allRawImportPrices.map(u=>u.alloy).filter(Boolean))].map(a=>(
-                      <button key={a} className={`btn btn-sm ${marketAlloy===a?'btn-purple':'btn-ghost'}`} style={{padding:'2px 10px',fontSize:'.68rem'}} onClick={()=>setMarketAlloy(a)}>{a==='ALL'?'Tất cả':a}</button>
-                    ))}
+                  {/* Bộ lọc thời gian + VAT + mác */}
+                  <div className="card" style={{padding:'8px 12px',marginBottom:10,display:'flex',gap:12,flexWrap:'wrap',alignItems:'center'}}>
+                    <div style={{display:'flex',gap:4,alignItems:'center'}}>
+                      <span style={{fontSize:'.66rem',fontWeight:800,color:'#475569'}}>Khoảng thời gian:</span>
+                      {[['30','30 ngày'],['90','90 ngày'],['180','180 ngày'],['ALL','Tất cả']].map(([k,l])=>(
+                        <button key={k} className={`btn btn-sm ${marketRange.preset===k?'btn-purple':'btn-ghost'}`} style={{padding:'2px 8px',fontSize:'.66rem'}} onClick={()=>setMarketRange(p=>({...p,preset:k}))}>{l}</button>
+                      ))}
+                      <span style={{fontSize:'.64rem',fontWeight:700,color:'#64748b',marginLeft:4}}>hoặc từ</span>
+                      <input type="date" className="inp inp-xs" style={{width:124}} value={marketRange.from} onChange={e=>setMarketRange(p=>({...p,preset:'custom',from:e.target.value}))}/>
+                      <span style={{fontSize:'.64rem',fontWeight:700,color:'#64748b'}}>đến</span>
+                      <input type="date" className="inp inp-xs" style={{width:124}} value={marketRange.to} onChange={e=>setMarketRange(p=>({...p,preset:'custom',to:e.target.value}))}/>
+                    </div>
+                    <label style={{display:'flex',gap:5,alignItems:'center',fontSize:'.66rem',fontWeight:800,color:'#475569',cursor:'pointer'}} title="SMM A00 là giá nội địa TQ ĐÃ GỒM 13% VAT. NCC xuất khẩu được hoàn VAT nên giá xuất neo theo SMM trừ VAT — bật để so chuẩn với LME và CIF.">
+                      <input type="checkbox" checked={smmExVat} onChange={e=>setSmmExVat(e.target.checked)}/> SMM trừ VAT 13%
+                    </label>
+                    <div style={{display:'flex',gap:4,alignItems:'center'}}>
+                      <span style={{fontSize:'.66rem',fontWeight:800,color:'#475569'}}>Mác:</span>
+                      {['ALL',...new Set(allRawImportPrices.map(u=>u.alloy).filter(Boolean))].map(a=>(
+                        <button key={a} className={`btn btn-sm ${marketAlloy===a?'btn-purple':'btn-ghost'}`} style={{padding:'2px 9px',fontSize:'.66rem'}} onClick={()=>setMarketAlloy(a)}>{a==='ALL'?'Tất cả':a}</button>
+                      ))}
+                    </div>
                   </div>
+
+                  {/* Thống kê & dự phóng — lấp khoảng trống, hỗ trợ nhận định */}
+                  {marketStats&&(
+                    <div style={{display:'flex',gap:10,flexWrap:'wrap',marginBottom:10}}>
+                      {[
+                        {l:'SMM hiện tại',v:`${fv(marketStats.last)} $/t`,c:'#0f172a'},
+                        {l:'Δ 7 ngày',v:marketStats.d7!=null?`${marketStats.d7>=0?'+':''}${marketStats.d7.toFixed(1)}%`:'—',c:marketStats.d7>0?'#dc2626':marketStats.d7<0?'#16a34a':'#475569'},
+                        {l:'Δ 30 ngày',v:marketStats.d30!=null?`${marketStats.d30>=0?'+':''}${marketStats.d30.toFixed(1)}%`:'—',c:marketStats.d30>0?'#dc2626':marketStats.d30<0?'#16a34a':'#475569'},
+                        {l:'Dải giá kỳ đang xem',v:`${fv(marketStats.min)}–${fv(marketStats.max)}`,c:'#475569',sub:`giá nay ở mức ${Math.round(marketStats.pos)}% dải`},
+                        {l:'Xu hướng SMA7/SMA30',v:marketStats.sma7>marketStats.sma30?'▲ Ngắn hạn TĂNG':marketStats.sma7<marketStats.sma30?'▼ Ngắn hạn GIẢM':'= Đi ngang',c:marketStats.sma7>marketStats.sma30?'#dc2626':'#16a34a',sub:`SMA7 ${fv(marketStats.sma7)} · SMA30 ${fv(marketStats.sma30)}`},
+                        {l:'Dự phóng 7 ngày (hồi quy 30đ)',v:`≈ ${fv(marketStats.f7)} $/t`,c:'#7c3aed',sub:`±${fv(marketStats.sd)} · độ dốc ${marketStats.slopeW>=0?'+':''}${fv(marketStats.slopeW)} $/tuần`},
+                      ].map((b,i)=>(
+                        <div key={i} className="card" style={{padding:'7px 12px',minWidth:150,flex:'1 1 150px'}}>
+                          <div style={{fontSize:'.6rem',fontWeight:800,color:'#64748b'}}>{b.l}</div>
+                          <div className="mono" style={{fontSize:'.84rem',fontWeight:900,color:b.c}}>{b.v}</div>
+                          {b.sub&&<div style={{fontSize:'.58rem',fontWeight:700,color:'#94a3b8'}}>{b.sub}</div>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
 
                   <div className="card" style={{padding:'12px 14px',marginBottom:12}}>
                     <div style={{height:340,position:'relative'}}><canvas ref={marketChartRef}></canvas></div>
-                    <div style={{fontSize:'.64rem',color:'#94a3b8',fontWeight:600,marginTop:6}}>◆ xanh lá = CIF mua thực tế từng đợt (sheet Giá nhập cập nhật) · đường đỏ = SMM A00 quy USD theo tỷ giá từng ngày · khoảng hở dọc giữa ◆ và đường đỏ = premium gia công + cước NCC đang tính.</div>
+                    <div style={{fontSize:'.64rem',color:'#94a3b8',fontWeight:600,marginTop:6}}>◆ xanh lá = CIF mua thực tế từng đợt · đỏ = SMM A00 {smmExVat?'đã trừ VAT 13%':'gồm VAT'} quy USD theo tỷ giá TỪNG NGÀY · xám đứt = trung bình động 30 ngày. ⚠ Dự phóng hồi quy chỉ là tham khảo xu hướng — giá kim loại ngắn hạn gần như ngẫu nhiên, không phải khuyến nghị chốt mua.</div>
                   </div>
 
                   <div className="card" style={{padding:'12px 14px'}}>
-                    <div style={{fontWeight:900,fontSize:'.82rem',color:'#0f172a',marginBottom:4}}>Premium động theo quy cách <span style={{fontSize:'.64rem',fontWeight:700,color:'#64748b'}}>(premium = CIF đợt nhập − SMM quy đổi cùng thời điểm · KHÔNG cào bằng)</span></div>
-                    <table className="tbl" style={{fontSize:'.72rem'}}>
+                    <div style={{fontWeight:900,fontSize:'.82rem',color:'#0f172a',marginBottom:6}}>Premium động theo quy cách <span style={{fontSize:'.64rem',fontWeight:700,color:'#64748b'}}>(premium = CIF đợt nhập − SMM{smmExVat?' trừ VAT':''} cùng thời điểm)</span></div>
+                    <table className="tbl" style={{fontSize:'.74rem'}}>
                       <thead><tr>
-                        <th style={{textAlign:'left'}}>Quy cách</th><th>Số đợt</th><th>CIF gần nhất<div style={{fontSize:'.54rem',fontWeight:600,opacity:.75}}>$/t · ngày</div></th><th>Premium gần nhất<div style={{fontSize:'.54rem',fontWeight:600,opacity:.75}}>$/t</div></th><th>Premium TB<div style={{fontSize:'.54rem',fontWeight:600,opacity:.75}}>$/t</div></th><th>CIF tham chiếu hôm nay<div style={{fontSize:'.54rem',fontWeight:600,opacity:.75}}>SMM nay + Premium TB</div></th><th>Xu hướng premium</th>
+                        <th style={{textAlign:'left',paddingLeft:10}}>Quy cách</th>
+                        <th style={{textAlign:'center',width:54}}>Số đợt</th>
+                        <th style={{textAlign:'right',paddingRight:12}}>CIF gần nhất ($/t)</th>
+                        <th style={{textAlign:'right',paddingRight:12}}>Premium gần nhất</th>
+                        <th style={{textAlign:'right',paddingRight:12}}>Premium TB</th>
+                        <th style={{textAlign:'right',paddingRight:12,background:'#ecfeff'}}>CIF tham chiếu nay</th>
+                        <th style={{textAlign:'center',width:110}}>Xu hướng premium</th>
                       </tr></thead>
                       <tbody>
                         {marketPremiumStats.filter(g=>marketAlloy==='ALL'||g.alloy===marketAlloy).map((g,i)=>{
                           const trendPct=(g.premAvg&&g.premLast!=null&&g.premAvg!==0)?(g.premLast-g.premAvg)/Math.abs(g.premAvg)*100:null;
                           return (
-                            <tr key={i}>
-                              <td style={{textAlign:'left',fontWeight:800}}>{g.alloy} {g.temper} <span style={{color:'#64748b',fontWeight:700}}>{g.range}</span></td>
-                              <td className="mono">{g.n}</td>
-                              <td className="mono">{fv(g.lastCIF)} <span style={{fontSize:'.6rem',color:'#94a3b8'}}>{g.lastDate}</span></td>
-                              <td className="mono" style={{fontWeight:800}}>{g.premLast!=null?fv(g.premLast):'—'}</td>
-                              <td className="mono">{g.premAvg!=null?fv(g.premAvg):'—'}</td>
-                              <td className="mono" style={{fontWeight:900,color:'#0891b2'}}>{g.refCIF!=null?fv(g.refCIF):'—'}</td>
-                              <td>{trendPct==null?<span style={{color:'#cbd5e1'}}>—</span>:<span style={{fontWeight:900,color:trendPct>5?'#b91c1c':trendPct<-5?'#15803d':'#475569'}}>{trendPct>0?'▲ +':trendPct<0?'▼ ':''}{trendPct.toFixed(1)}%</span>}</td>
+                            <tr key={i} style={{background:i%2?'#f8fafc':'transparent'}}>
+                              <td style={{textAlign:'left',paddingLeft:10,whiteSpace:'nowrap'}}><span style={{fontWeight:900}}>{g.alloy} {g.temper}</span> <span style={{color:'#64748b',fontWeight:700,fontSize:'.68rem'}}>{g.range}</span></td>
+                              <td style={{textAlign:'center'}} className="mono">{g.n}</td>
+                              <td style={{textAlign:'right',paddingRight:12}} className="mono"><span style={{fontWeight:900}}>{fv(g.lastCIF)}</span><div style={{fontSize:'.58rem',color:'#94a3b8',fontWeight:600}}>{g.lastDate}</div></td>
+                              <td style={{textAlign:'right',paddingRight:12,fontWeight:800}} className="mono">{g.premLast!=null?fv(g.premLast):'—'}</td>
+                              <td style={{textAlign:'right',paddingRight:12}} className="mono">{g.premAvg!=null?fv(g.premAvg):'—'}</td>
+                              <td style={{textAlign:'right',paddingRight:12,fontWeight:900,color:'#0e7490',background:'#f0fdff'}} className="mono">{g.refCIF!=null?fv(g.refCIF):'—'}</td>
+                              <td style={{textAlign:'center'}}>{trendPct==null?<span style={{color:'#cbd5e1'}}>—</span>:<span className="mono" style={{fontWeight:900,fontSize:'.7rem',borderRadius:4,padding:'2px 8px',background:trendPct>5?'#fee2e2':trendPct<-5?'#dcfce7':'#f1f5f9',color:trendPct>5?'#b91c1c':trendPct<-5?'#15803d':'#475569'}}>{trendPct>0?'▲ +':trendPct<0?'▼ ':'='}{trendPct.toFixed(1)}%</span>}</td>
                             </tr>
                           );
                         })}
                         {marketPremiumStats.filter(g=>marketAlloy==='ALL'||g.alloy===marketAlloy).length===0&&(
-                          <tr><td colSpan={7} style={{padding:14,color:'#94a3b8',fontWeight:600}}>Chưa có dữ liệu CIF (sheet Giá nhập cập nhật) khớp bộ lọc — hoặc chưa backfill lịch sử SMM (chạy backfillMarketHistory).</td></tr>
+                          <tr><td colSpan={7} style={{padding:14,color:'#94a3b8',fontWeight:600}}>Chưa có dữ liệu CIF khớp bộ lọc — hoặc chưa backfill lịch sử SMM (chạy backfillMarketHistory).</td></tr>
                         )}
                       </tbody>
                     </table>
-                    <div style={{fontSize:'.64rem',color:'#94a3b8',fontWeight:600,marginTop:6}}>ℹ️ PriceFC trong sheet = giá về tới cảng VN (chưa gồm CP về kho {inputs.managementFee||1.5}% — chỉnh ở tab PAKD Mua). Xu hướng ▲ đỏ = premium đợt mới cao hơn trung bình các đợt trước &gt;5% — NCC đang chém.</div>
+                    <div style={{fontSize:'.64rem',color:'#94a3b8',fontWeight:600,marginTop:6}}>ℹ️ PriceFC = giá về tới cảng VN (chưa gồm CP về kho {inputs.managementFee||1.5}% — chỉnh ở tab PAKD Mua). Xu hướng ▲ đỏ = premium đợt mới cao hơn TB các đợt trước &gt;5% (NCC đang chém) · ▼ xanh = premium đang hạ.</div>
                   </div>
                 </>
               )}

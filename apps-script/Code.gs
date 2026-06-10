@@ -412,43 +412,109 @@ function writeMarketRow_(v){
   return { ok: true, msg: 'Đã ghi giá ngày ' + today };
 }
 
-// ═══ R2: BACKFILL lịch sử giá các ngày TRƯỚC hôm nay (chạy tay 1 lần) ═══
-// Lấy mảng historical từ API worthwill (smm/lme/shfe), điền các ngày còn thiếu vào MARKET_PRICES.
-// Lưu ý: smm_usd các ngày cũ quy đổi bằng TỶ GIÁ HIỆN TẠI (xấp xỉ — đủ tốt để nhìn xu hướng premium).
+// ═══ R3: BACKFILL lịch sử giá (chạy tay 1 lần; chạy lại = xóa & dựng lại các dòng backfill) ═══
+// SỬA so với R2 (anh Huy phát hiện SMM quá khứ cao bất thường):
+//  1. Quy đổi SMM→USD bằng TỶ GIÁ LỊCH SỬ TỪNG NGÀY (GOOGLEFINANCE historical) — không dùng tỷ giá hôm nay
+//     (tỷ lệ SMM¥/LME$ đổi từ 7.8 → 6.6 trong 9 tháng, dùng tỷ giá nay làm SMM cũ bị thổi phồng 10-18%).
+//  2. LME ưu tiên bảng cash settlement CHÍNH THỐNG Westmetall (worthwill thấp hơn ~1-3%), thiếu mới dùng worthwill.
 function backfillMarketHistory(){
+  const tz = ss_().getSpreadsheetTimeZone();
+  const iso = v => Utilities.formatDate(v instanceof Date ? v : new Date(v), tz, 'yyyy-MM-dd');
+  // 1) Giá lịch sử từ worthwill
   const get = kind => { const r = fetchJson_(WW_API + kind); return (r && r.data && r.data.historical) ? r.data.historical : []; };
-  const smmH = get('smm'), lmeH = get('lme'), shfeH = get('shfe');
-  const fx = fetchFxRates_();
   const num = v => { const f = parseFloat(String(v).replace(/,/g, '')); return isNaN(f) ? null : f; };
   const byDate = {};
-  smmH.forEach(h => { const d = String(h.date).slice(0, 10); if (!d) return; (byDate[d] = byDate[d] || {}).smm = num(h.average); byDate[d].smmMove = num(h.move); });
-  lmeH.forEach(h => { const d = String(h.date).slice(0, 10); if (!d) return; (byDate[d] = byDate[d] || {}).lme = num(h.average || h.end); });
-  shfeH.forEach(h => { const d = String(h.date).slice(0, 10); if (!d) return; (byDate[d] = byDate[d] || {}).shfe = num(h.close_price || h.settlement_price); });
-
+  get('smm').forEach(h => { const d = String(h.date).slice(0, 10); if (!d) return; (byDate[d] = byDate[d] || {}).smm = num(h.average); byDate[d].smmMove = num(h.move); });
+  get('lme').forEach(h => { const d = String(h.date).slice(0, 10); if (!d) return; (byDate[d] = byDate[d] || {}).lmeWW = num(h.average || h.end); });
+  get('shfe').forEach(h => { const d = String(h.date).slice(0, 10); if (!d) return; (byDate[d] = byDate[d] || {}).shfe = num(h.close_price || h.settlement_price); });
+  // 2) LME chính thống từ Westmetall (toàn bộ bảng)
+  const wmLME = {};
+  try {
+    const html = UrlFetchApp.fetch('https://www.westmetall.com/en/markdaten.php?action=table&field=LME_Al_cash',
+      { muteHttpExceptions: true, headers: { 'User-Agent': 'Mozilla/5.0' } }).getContentText();
+    const MON = { January:1, February:2, March:3, April:4, May:5, June:6, July:7, August:8, September:9, October:10, November:11, December:12 };
+    const re = /<td >(\d{2})\.\s*(\w+)\s*(\d{4})<\/td>\s*<td >([\d,.]+)<\/td>/g; let m;
+    while ((m = re.exec(html)) !== null){
+      if (MON[m[2]]) wmLME[m[3] + '-' + ('0' + MON[m[2]]).slice(-2) + '-' + m[1]] = parseFloat(m[4].replace(/,/g, ''));
+    }
+  } catch (e){ Logger.log('⚠ Westmetall lỗi (' + e.message + ') — dùng LME worthwill'); }
+  // 3) Tỷ giá LỊCH SỬ qua GOOGLEFINANCE (sheet FX_HELPER, cột D-E và G-H)
   const ss = ss_();
+  let fxh = ss.getSheetByName('FX_HELPER');
+  if (!fxh){ fxh = ss.insertSheet('FX_HELPER'); try { fxh.hideSheet(); } catch (e){} }
+  fxh.getRange('D1').setFormula('=GOOGLEFINANCE("CURRENCY:USDVND","price",DATE(2025,8,1),TODAY()+1,"DAILY")');
+  fxh.getRange('G1').setFormula('=GOOGLEFINANCE("CURRENCY:CNYVND","price",DATE(2025,8,1),TODAY()+1,"DAILY")');
+  SpreadsheetApp.flush();
+  let usdHist = [], cnyHist = [];
+  for (var w = 0; w < 15; w++){
+    Utilities.sleep(1500);
+    usdHist = fxh.getRange('D2:E500').getValues().filter(r => r[0] && r[1]);
+    cnyHist = fxh.getRange('G2:H500').getValues().filter(r => r[0] && r[1]);
+    if (usdHist.length > 10 && cnyHist.length > 10) break;
+  }
+  const mkFx = arr => { const m = {}; arr.forEach(r => { m[iso(r[0])] = parseFloat(r[1]); }); return m; };
+  const usdMap = mkFx(usdHist), cnyMap = mkFx(cnyHist);
+  const fxDates = Object.keys(usdMap).sort();
+  const fxAt = (d, map) => { // tỷ giá ngày gần nhất ≤ d (cuối tuần dùng thứ 6 trước đó)
+    let best = null; for (var i = 0; i < fxDates.length; i++){ if (fxDates[i] <= d && map[fxDates[i]]) best = map[fxDates[i]]; if (fxDates[i] > d) break; }
+    return best;
+  };
+  if (fxDates.length < 10){ Logger.log('✗ GOOGLEFINANCE chưa trả tỷ giá lịch sử — thử chạy lại sau 1 phút'); return; }
+  // 4) Dựng lại sheet: GIỮ dòng daily (fetched_at là giờ), XÓA dòng backfill cũ, thêm bản mới
   let sh = ss.getSheetByName(MARKET_SHEET);
   if (!sh){
     sh = ss.insertSheet(MARKET_SHEET);
     sh.appendRow(['date', 'lme_usd', 'shfe_cny', 'smm_cny', 'smm_move', 'smm_usd', 'usd_vnd', 'cny_vnd', 'fetched_at']);
     sh.setFrozenRows(1);
   }
-  const existing = {};
-  if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues().forEach(r => {
-    const d = r[0] instanceof Date ? Utilities.formatDate(r[0], 'GMT+7', 'yyyy-MM-dd') : String(r[0]).slice(0, 10);
-    existing[d] = true;
-  });
-  const dates = Object.keys(byDate).sort().slice(-200); // tối đa 200 ngày gần nhất
+  const all = sh.getDataRange().getValues();
+  const header = all[0];
+  const kept = []; const keptDates = {};
+  for (var r = 1; r < all.length; r++){
+    if (String(all[r][8]) === 'backfill') continue; // bỏ backfill cũ (tỷ giá sai)
+    kept.push(all[r]); keptDates[iso(all[r][0])] = true;
+  }
   const newRows = [];
-  dates.forEach(d => {
-    if (existing[d]) return;
+  Object.keys(byDate).sort().slice(-220).forEach(d => {
+    if (keptDates[d]) return;
     const v = byDate[d];
-    const smmUsd = (v.smm != null && fx.usd && fx.cny) ? Math.round(v.smm * fx.cny / fx.usd * 10) / 10 : null;
-    newRows.push([d, v.lme || null, v.shfe || null, v.smm || null, v.smmMove || null, smmUsd, fx.usd, fx.cny, 'backfill']);
+    const usd = fxAt(d, usdMap), cny = fxAt(d, cnyMap);
+    const lme = (wmLME[d] != null) ? wmLME[d] : v.lmeWW;
+    const smmUsd = (v.smm != null && usd && cny) ? Math.round(v.smm * cny / usd * 10) / 10 : null;
+    newRows.push([d, lme || null, v.shfe || null, v.smm || null, v.smmMove || null, smmUsd, usd || null, cny || null, 'backfill']);
   });
-  if (newRows.length) sh.getRange(sh.getLastRow() + 1, 1, newRows.length, newRows[0].length).setValues(newRows);
-  // sắp xếp lại theo ngày tăng dần
-  if (sh.getLastRow() > 2) sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).sort({ column: 1, ascending: true });
-  Logger.log('✓ Backfill xong: thêm ' + newRows.length + ' ngày (SMM lịch sử có ' + smmH.length + ' bản ghi từ API)');
+  const merged = kept.concat(newRows).sort((a, b) => (iso(a[0]) < iso(b[0]) ? -1 : 1));
+  if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, header.length).clearContent();
+  if (merged.length) sh.getRange(2, 1, merged.length, header.length).setValues(merged);
+  Logger.log('✓ Backfill v2: ' + newRows.length + ' dòng mới (tỷ giá lịch sử ' + fxDates.length + ' ngày, LME Westmetall ' + Object.keys(wmLME).length + ' ngày), giữ ' + kept.length + ' dòng daily.');
+}
+
+// ═══ R3: THẨM ĐỊNH dữ liệu giá — chạy tay, xem Nhật ký thực thi ═══
+// So LME worthwill vs Westmetall (chuẩn cash settlement) các ngày trùng + soát tỷ lệ SMM/LME bất thường.
+function verifyMarketHistory(){
+  const r = fetchJson_(WW_API + 'lme');
+  const ww = {}; ((r && r.data && r.data.historical) || []).forEach(h => { const f = parseFloat(h.average || h.end); if (f) ww[String(h.date).slice(0, 10)] = f; });
+  const html = UrlFetchApp.fetch('https://www.westmetall.com/en/markdaten.php?action=table&field=LME_Al_cash',
+    { muteHttpExceptions: true, headers: { 'User-Agent': 'Mozilla/5.0' } }).getContentText();
+  const MON = { January:1, February:2, March:3, April:4, May:5, June:6, July:7, August:8, September:9, October:10, November:11, December:12 };
+  const re = /<td >(\d{2})\.\s*(\w+)\s*(\d{4})<\/td>\s*<td >([\d,.]+)<\/td>/g; let m; const wm = {};
+  while ((m = re.exec(html)) !== null){ if (MON[m[2]]) wm[m[3] + '-' + ('0' + MON[m[2]]).slice(-2) + '-' + m[1]] = parseFloat(m[4].replace(/,/g, '')); }
+  const common = Object.keys(ww).filter(d => wm[d]).sort().slice(-30);
+  if (!common.length){ Logger.log('✗ Không có ngày trùng để so'); return; }
+  let sum = 0, worst = 0, worstD = '';
+  common.forEach(d => { const diff = ww[d] - wm[d]; sum += Math.abs(diff); if (Math.abs(diff) > Math.abs(worst)){ worst = diff; worstD = d; } });
+  Logger.log('LME worthwill vs Westmetall (' + common.length + ' ngày gần nhất): lệch TB ' + Math.round(sum / common.length) + ' $/t, lệch lớn nhất ' + Math.round(worst) + ' $/t (' + worstD + ')');
+  Logger.log('→ Backfill đã ưu tiên số Westmetall; lệch <120 $/t (~3%) là bình thường (worthwill lấy trung bình phiên, WM lấy cash settlement).');
+  // Soát MARKET_PRICES: tỷ lệ smm_cny/lme_usd phải nằm trong 6.0–8.5
+  const sh = ss_().getSheetByName(MARKET_SHEET);
+  if (sh && sh.getLastRow() > 1){
+    const data = sh.getDataRange().getValues(); let bad = 0;
+    for (var i = 1; i < data.length; i++){
+      const lme = parseFloat(data[i][1]), smm = parseFloat(data[i][3]);
+      if (lme > 0 && smm > 0){ const ratio = smm / lme; if (ratio < 6.0 || ratio > 8.5) bad++; }
+    }
+    Logger.log(bad === 0 ? '✓ Tỷ lệ SMM¥/LME$ toàn bộ dữ liệu trong vùng hợp lý 6.0–8.5' : ('⚠ ' + bad + ' dòng có tỷ lệ SMM/LME bất thường — kiểm tra tay tab MARKET_PRICES'));
+  }
 }
 
 // CHẨN ĐOÁN: chạy hàm này để biết nguồn nào sống/chết/treo từ máy chủ Google (xem Nhật ký thực thi)
