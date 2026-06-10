@@ -290,8 +290,7 @@ function alertPendingPA_(alerts){
 // Nguồn chính: worthwillaluminium.com/api/price/{smm|lme|shfe} (miễn phí, JSON sạch).
 // Dự phòng: LME → westmetall.com ; SHFE → shfe.com.cn .dat. SMM miễn phí chỉ có nguồn chính.
 // Tỷ giá USD/CNY: XML công khai Vietcombank.
-// Script properties thêm (tùy chọn): CIF_PREMIUM_USD (phí gia công+cước cộng vào SMM ingot, mặc định 0),
-//                                    CIF_ALERT_PCT (ngưỡng cảnh báo %, mặc định 3).
+// Script properties (tùy chọn): CIF_ALERT_PCT — ngưỡng %% premium đợt mới vượt TB các đợt trước thì cảnh báo (mặc định 10).
 const MARKET_SHEET = 'MARKET_PRICES';
 const WW_API = 'https://www.worthwillaluminium.com/api/price/';
 
@@ -413,6 +412,45 @@ function writeMarketRow_(v){
   return { ok: true, msg: 'Đã ghi giá ngày ' + today };
 }
 
+// ═══ R2: BACKFILL lịch sử giá các ngày TRƯỚC hôm nay (chạy tay 1 lần) ═══
+// Lấy mảng historical từ API worthwill (smm/lme/shfe), điền các ngày còn thiếu vào MARKET_PRICES.
+// Lưu ý: smm_usd các ngày cũ quy đổi bằng TỶ GIÁ HIỆN TẠI (xấp xỉ — đủ tốt để nhìn xu hướng premium).
+function backfillMarketHistory(){
+  const get = kind => { const r = fetchJson_(WW_API + kind); return (r && r.data && r.data.historical) ? r.data.historical : []; };
+  const smmH = get('smm'), lmeH = get('lme'), shfeH = get('shfe');
+  const fx = fetchFxRates_();
+  const num = v => { const f = parseFloat(String(v).replace(/,/g, '')); return isNaN(f) ? null : f; };
+  const byDate = {};
+  smmH.forEach(h => { const d = String(h.date).slice(0, 10); if (!d) return; (byDate[d] = byDate[d] || {}).smm = num(h.average); byDate[d].smmMove = num(h.move); });
+  lmeH.forEach(h => { const d = String(h.date).slice(0, 10); if (!d) return; (byDate[d] = byDate[d] || {}).lme = num(h.average || h.end); });
+  shfeH.forEach(h => { const d = String(h.date).slice(0, 10); if (!d) return; (byDate[d] = byDate[d] || {}).shfe = num(h.close_price || h.settlement_price); });
+
+  const ss = ss_();
+  let sh = ss.getSheetByName(MARKET_SHEET);
+  if (!sh){
+    sh = ss.insertSheet(MARKET_SHEET);
+    sh.appendRow(['date', 'lme_usd', 'shfe_cny', 'smm_cny', 'smm_move', 'smm_usd', 'usd_vnd', 'cny_vnd', 'fetched_at']);
+    sh.setFrozenRows(1);
+  }
+  const existing = {};
+  if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, 1).getValues().forEach(r => {
+    const d = r[0] instanceof Date ? Utilities.formatDate(r[0], 'GMT+7', 'yyyy-MM-dd') : String(r[0]).slice(0, 10);
+    existing[d] = true;
+  });
+  const dates = Object.keys(byDate).sort().slice(-200); // tối đa 200 ngày gần nhất
+  const newRows = [];
+  dates.forEach(d => {
+    if (existing[d]) return;
+    const v = byDate[d];
+    const smmUsd = (v.smm != null && fx.usd && fx.cny) ? Math.round(v.smm * fx.cny / fx.usd * 10) / 10 : null;
+    newRows.push([d, v.lme || null, v.shfe || null, v.smm || null, v.smmMove || null, smmUsd, fx.usd, fx.cny, 'backfill']);
+  });
+  if (newRows.length) sh.getRange(sh.getLastRow() + 1, 1, newRows.length, newRows[0].length).setValues(newRows);
+  // sắp xếp lại theo ngày tăng dần
+  if (sh.getLastRow() > 2) sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).sort({ column: 1, ascending: true });
+  Logger.log('✓ Backfill xong: thêm ' + newRows.length + ' ngày (SMM lịch sử có ' + smmH.length + ' bản ghi từ API)');
+}
+
 // CHẨN ĐOÁN: chạy hàm này để biết nguồn nào sống/chết/treo từ máy chủ Google (xem Nhật ký thực thi)
 function testMarketSources(){
   const tests = [
@@ -450,36 +488,64 @@ function doGet(e){
   return json_({ ok: false, error: 'Action không hợp lệ' });
 }
 
-// 4) CIF chào cao hơn thị trường: so giá CIF mới nhất (sheet Giá nhập cập nhật) với SMM quy đổi + premium
-const GID_UPDATED_IMPORT = 1371908903;
+// 4) R2: Premium ĐỘNG theo quy cách — cảnh báo khi premium đợt CIF MỚI NHẤT của 1 quy cách
+// cao hơn premium TRUNG BÌNH các đợt trước của CHÍNH quy cách đó > CIF_ALERT_PCT % (mặc định 10).
+// premium_i = priceFC_i − SMM quy đổi USD tại ngày đợt i (đọc tab MARKET_PRICES — cần backfill).
 function alertCIFvsMarket_(alerts){
   const sh = ss_().getSheetByName(MARKET_SHEET);
   if (!sh || sh.getLastRow() < 2) return;
-  const H = sh.getDataRange().getValues()[0];
-  const lastRow = sh.getRange(sh.getLastRow(), 1, 1, H.length).getValues()[0];
-  const get = name => { const i = H.indexOf(name); return i >= 0 ? parseFloat(lastRow[i]) : NaN; };
-  const smmUsd = get('smm_usd');
-  if (!smmUsd || isNaN(smmUsd)) return;
-  const premium = parseFloat(props_().getProperty('CIF_PREMIUM_USD')) || 0;
-  const pct = parseFloat(props_().getProperty('CIF_ALERT_PCT')) || 3;
-  const benchmark = smmUsd + premium;
+  const md = sh.getDataRange().getValues();
+  const Hm = md[0];
+  const cD = Hm.indexOf('date'), cS = Hm.indexOf('smm_usd');
+  if (cD < 0 || cS < 0) return;
+  const smmSeries = [];
+  for (var i = 1; i < md.length; i++){
+    const d = md[i][cD] instanceof Date ? Utilities.formatDate(md[i][cD], 'GMT+7', 'yyyy-MM-dd') : String(md[i][cD]).slice(0, 10);
+    const v = parseFloat(md[i][cS]);
+    if (d && !isNaN(v) && v > 0) smmSeries.push({ d: d, v: v });
+  }
+  if (!smmSeries.length) return;
+  smmSeries.sort(function(a, b){ return a.d < b.d ? -1 : 1; });
+  const smmAt = function(iso){ var best = null; for (var x = 0; x < smmSeries.length; x++){ if (smmSeries[x].d <= iso) best = smmSeries[x].v; else break; } return best != null ? best : smmSeries[0].v; };
 
   const ui = sheetByGid_(GID_UPDATED_IMPORT).getDataRange().getValues();
   const Hu = ui[0];
-  const cDate = colIdx_(Hu, ['updatedate', 'update date', 'ngaycapnhat']),
-        cA = colIdx_(Hu, ['alloy', 'mac']), cT = colIdx_(Hu, ['temper']),
-        cF = colIdx_(Hu, ['pricefc', 'price fc', 'giacif']);
-  if (cF < 0) return;
-  // lấy các dòng thuộc ngày cập nhật MỚI NHẤT
-  let latest = '';
-  for (var i = 1; i < ui.length; i++){ const d = String(ui[i][cDate] || ''); if (d > latest) latest = d; }
-  const over = [];
+  const uD = colIdx_(Hu, ['updatedate', 'update date', 'ngaycapnhat']),
+        uA = colIdx_(Hu, ['alloy', 'mac']), uT = colIdx_(Hu, ['temper']),
+        uMin = colIdx_(Hu, ['minthick', 'min thick']), uMax = colIdx_(Hu, ['maxthick', 'max thick']),
+        uF = colIdx_(Hu, ['pricefc', 'price fc', 'giacif']);
+  if (uF < 0 || uD < 0) return;
+  const toIso = function(v){
+    if (v instanceof Date) return Utilities.formatDate(v, 'GMT+7', 'yyyy-MM-dd');
+    const m = String(v || '').match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    return m ? m[3] + '-' + ('0' + m[2]).slice(-2) + '-' + ('0' + m[1]).slice(-2) : null;
+  };
+  const groups = {};
   for (var r = 1; r < ui.length; r++){
-    const row = ui[r];
-    if (String(row[cDate] || '') !== latest) continue;
-    const cif = parseFloat(row[cF]) || 0; if (cif <= 0) continue;
-    const diff = (cif - benchmark) / benchmark * 100;
-    if (diff > pct) over.push((row[cA] || '?') + ' ' + (row[cT] || '') + ': CIF chào ' + cif + ' $/t cao hơn SMM quy đổi+premium (' + Math.round(benchmark) + ' $/t) <b>' + diff.toFixed(1) + '%</b>');
+    const cif = parseFloat(ui[r][uF]) || 0; if (cif <= 0) continue;
+    const iso = toIso(ui[r][uD]); if (!iso) continue;
+    const key = [ui[r][uA], ui[r][uT], ui[r][uMin], ui[r][uMax]].join('|');
+    (groups[key] = groups[key] || []).push({ iso: iso, cif: cif, label: ui[r][uA] + ' ' + ui[r][uT] + ' ' + ui[r][uMin] + '-' + ui[r][uMax] + 'mm' });
   }
-  if (over.length) alerts.push('📈 <b>' + over.length + ' giá CIF chào cao hơn thị trường &gt;' + pct + '%</b> (SMM ' + Math.round(smmUsd) + ' $/t + premium ' + premium + '):<br>• ' + over.join('<br>• '));
+  const pct = parseFloat(props_().getProperty('CIF_ALERT_PCT')) || 10;
+  const over = [];
+  Object.keys(groups).forEach(function(key){
+    const es = groups[key].sort(function(a, b){ return a.iso < b.iso ? -1 : 1; });
+    if (es.length < 2) return; // cần ít nhất 2 đợt mới so được xu hướng
+    const prems = es.map(function(e){ return e.cif - smmAt(e.iso); });
+    const last = prems[prems.length - 1];
+    const prior = prems.slice(0, -1);
+    const avg = prior.reduce(function(a, b){ return a + b; }, 0) / prior.length;
+    if (avg > 0 && (last - avg) / avg * 100 > pct){
+      over.push(es[es.length - 1].label + ': premium đợt mới <b>' + Math.round(last) + ' $/t</b> vs TB trước ' + Math.round(avg) + ' $/t (+' + ((last - avg) / avg * 100).toFixed(1) + '%)');
+    }
+  });
+  if (over.length) alerts.push('📈 <b>' + over.length + ' quy cách bị NCC tăng premium &gt;' + pct + '%</b> so các đợt trước:<br>• ' + over.join('<br>• '));
+}
+
+// ── HÀM DÒ NHANH: chạy hàm này đầu tiên khi gặp "lỗi không xác định".
+// Nếu CHÍNH NÓ cũng lỗi → vấn đề ở phiên đăng nhập/hạ tầng Google, KHÔNG phải code.
+function testNhanh(){
+  Logger.log('✓ Apps Script chạy bình thường lúc ' + new Date());
+  Logger.log('✓ Đọc được spreadsheet: ' + ss_().getName());
 }

@@ -1,7 +1,7 @@
 import React from 'react';
 const {useState,useEffect,useRef,useMemo,useCallback,Component}=React;
 import Chart from 'chart.js/auto';
-import {ALLOYS,COMBINING,DEFAULT_MGMT_GROUPS,GSHEET_CASHFLOW,GSHEET_FLOOR_HISTORY,GSHEET_INVENTORY,GSHEET_LIMITS,GSHEET_MINSTOCK,GSHEET_MONTHLY_REVENUE,GSHEET_PO,GSHEET_UPDATED_IMPORT,LENGTHS,TEMPERS,THICKS,WIDTHS,approvalProgress,findByPin,hashPin,pinMatches,calcAlloySummary,calcFinance,calcFloorPricePerSku,calcInvoice,calcLanded,calcLimitsWarnings,calcMgmtGroups,calcProductBreakdown,calcSkuBlend,coatingFromGSheet,defInputs,defInventory,defLimits,defMinStock,defProducts,defSP,defUpdatedImport,expandWildcardProducts,fetchCsv,fetchText,filterLatestUIP,filterPrevWeekUIP,findUpdatedImportPrice,fu,fv,groupBySku,normThick,parseCsv,parsePOData,parseVNDate,pn,sha256,skuKey,skuKeyNorm,skuLabel,stepOf,stripVN,uid,weightedAvg} from './lib/core';
+import {ALLOYS,COMBINING,DEFAULT_MGMT_GROUPS,GSHEET_CASHFLOW,GSHEET_FLOOR_HISTORY,GSHEET_INVENTORY,GSHEET_LIMITS,GSHEET_MINSTOCK,GSHEET_PO,GSHEET_UPDATED_IMPORT,LENGTHS,TEMPERS,THICKS,WIDTHS,approvalProgress,findByPin,hashPin,pinMatches,calcFinance,calcFloorPricePerSku,calcInvoice,calcLanded,calcLimitsWarnings,calcMgmtGroups,calcProductBreakdown,calcSkuBlend,coatingFromGSheet,defInputs,defInventory,defLimits,defMinStock,defProducts,defSP,defUpdatedImport,expandWildcardProducts,fetchCsv,fetchText,filterLatestUIP,filterPrevWeekUIP,findUpdatedImportPrice,fu,fv,groupBySku,normThick,parseCsv,parsePOData,parseVNDate,pn,sha256,skuKey,skuKeyNorm,skuLabel,stepOf,stripVN,uid,weightedAvg} from './lib/core';
 import {getCurrentWeekLabel,matchWeekLabel,parseCashFlowCSV} from './lib/cashflow';
 import {FilterBar,Ic,LimitBar,SkuLabelCell,SkuSel} from './components/ui';
 import {CashFlowTab} from './components/CashFlowTab';
@@ -36,7 +36,6 @@ const App=()=>{
   const [dbStatus,setDbStatus]=useState({loading:false,error:null,lastSync:null,source:'local'});
   const [floorHistory,setFloorHistory]=useState(()=>{try{const s=localStorage.getItem('pakd_floor_history');return s?JSON.parse(s):[];}catch(e){return [];}});
   const [histFilter,setHistFilter]=useState({group:'ALL',dateFrom:'',dateTo:''});
-  const [monthlyRevenue,setMonthlyRevenue]=useState([]);
   const [cashFlowData,setCashFlowData]=useState([]);
   const [cfMode,setCFMode]=useState('auto');
   const [cfManualWeek,setCFManualWeek]=useState('');
@@ -541,16 +540,77 @@ const App=()=>{
   const loadMarket=useCallback(async()=>{
     if(!gasConfig.url) return;
     try{
-      const res=await fetch(`${gasConfig.url}?action=market&secret=${encodeURIComponent(gasConfig.secret||'')}&n=30`);
+      const res=await fetch(`${gasConfig.url}?action=market&secret=${encodeURIComponent(gasConfig.secret||'')}&n=400`);
       const d=await res.json();
       if(d.ok){setMarketData(d.rows||[]);setMarketErr(null);}
       else setMarketErr(d.error||'?');
     }catch(e){setMarketErr(e.message);}
   },[gasConfig.url,gasConfig.secret]);
   useEffect(()=>{loadMarket();},[loadMarket]);
-  // Cấu hình so sánh CIF: premium (gia công + cước, USD/tấn) + ngưỡng cảnh báo %
-  const [marketCfg,setMarketCfg]=useState(()=>{try{return {premium:0,alertPct:3,...JSON.parse(localStorage.getItem('pakd_market_cfg')||'{}')};}catch(e){return {premium:0,alertPct:3};}});
-  const saveMarketCfg=(c)=>{setMarketCfg(c);try{localStorage.setItem('pakd_market_cfg',JSON.stringify(c));}catch(e){}};
+  // R2: KHÔNG dùng premium chung — premium động suy từ lịch sử CIF của TỪNG quy cách [Mác|Temper|Dải dày].
+  const [marketAlloy,setMarketAlloy]=useState('ALL'); // filter mác ở tab Thị trường
+  const marketChartRef=useRef(null);const marketChartInst=useRef(null);
+  // Premium từng quy cách: premium_i = CIF đợt i − SMM quy đổi USD tại ngày đợt đó
+  const marketPremiumStats=useMemo(()=>{
+    if(!marketData.length||!allRawImportPrices.length) return [];
+    const rows=[...marketData].slice().reverse(); // cũ → mới
+    const smmByDate=rows.map(r=>({d:String(r.date).slice(0,10),v:parseFloat(r.smm_usd)||null})).filter(x=>x.v);
+    if(!smmByDate.length) return [];
+    const smmAt=(iso)=>{let best=null;for(const x of smmByDate){if(x.d<=iso)best=x.v;else break;}return best!=null?best:smmByDate[0].v;};
+    const smmNow=smmByDate[smmByDate.length-1].v;
+    const groups={};
+    allRawImportPrices.forEach(u=>{
+      const cif=parseFloat(u.priceFC)||0;if(cif<=0)return;
+      const d=parseVNDate(u.updateDate);if(!d||isNaN(d.getTime()))return;
+      const iso=d.toISOString().slice(0,10);
+      const key=`${u.alloy}|${u.temper}|${u.minThick}-${u.maxThick}`;
+      if(!groups[key])groups[key]={alloy:u.alloy,temper:u.temper,range:`${u.minThick}–${u.maxThick}mm`,entries:[]};
+      groups[key].entries.push({iso,cif});
+    });
+    return Object.values(groups).map(g=>{
+      g.entries.sort((a,b)=>a.iso.localeCompare(b.iso));
+      const prems=g.entries.map(e=>{const s=smmAt(e.iso);return s?{iso:e.iso,p:e.cif-s}:null;}).filter(Boolean);
+      const lastE=g.entries[g.entries.length-1];
+      const premAvg=prems.length?prems.reduce((a,b)=>a+b.p,0)/prems.length:null;
+      const premLast=prems.length?prems[prems.length-1].p:null;
+      return {...g,n:g.entries.length,lastDate:lastE.iso,lastCIF:lastE.cif,premAvg,premLast,
+              refCIF:(smmNow!=null&&premAvg!=null)?smmNow+premAvg:null,smmNow};
+    }).sort((a,b)=>a.alloy.localeCompare(b.alloy)||a.temper.localeCompare(b.temper)||a.range.localeCompare(b.range));
+  },[marketData,allRawImportPrices]);
+  // Vẽ biểu đồ đường SMM/LME/SHFE (quy USD/t) + điểm CIF lịch sử của mác đang lọc
+  useEffect(()=>{
+    if(tab!=='market'||!marketChartRef.current) return;
+    if(typeof Chart==='undefined'||!marketData.length) return;
+    try{
+      const rows=[...marketData].slice().reverse();
+      const num=v=>{const f=parseFloat(v);return isNaN(f)?null:f;};
+      const labels=rows.map(r=>String(r.date).slice(0,10));
+      const shfeUsd=rows.map(r=>{const s=num(r.shfe_cny),u=num(r.usd_vnd),c=num(r.cny_vnd);return (s&&u&&c)?Math.round(s*c/u*10)/10:null;});
+      const cifPoints=[];
+      allRawImportPrices.forEach(u=>{
+        if(marketAlloy!=='ALL'&&u.alloy!==marketAlloy) return;
+        const cif=num(u.priceFC);if(!cif)return;
+        const d=parseVNDate(u.updateDate);if(!d||isNaN(d.getTime()))return;
+        const iso=d.toISOString().slice(0,10);
+        let lbl=labels.includes(iso)?iso:null;
+        if(!lbl){for(let i=labels.length-1;i>=0;i--){if(labels[i]<=iso){lbl=labels[i];break;}}}
+        if(!lbl)lbl=labels[0];
+        cifPoints.push({x:lbl,y:cif,spec:`${u.alloy} ${u.temper} ${u.minThick}-${u.maxThick}mm · ${u.updateDate}`});
+      });
+      if(marketChartInst.current) marketChartInst.current.destroy();
+      marketChartInst.current=new Chart(marketChartRef.current.getContext('2d'),{type:'line',
+        data:{labels,datasets:[
+          {label:'SMM A00 quy đổi ($/t)',data:rows.map(r=>num(r.smm_usd)),borderColor:'#dc2626',backgroundColor:'#dc2626',borderWidth:2,pointRadius:0,spanGaps:true,tension:.25},
+          {label:'LME cash ($/t)',data:rows.map(r=>num(r.lme_usd)),borderColor:'#2563eb',backgroundColor:'#2563eb',borderWidth:2,pointRadius:0,spanGaps:true,tension:.25},
+          {label:'SHFE quy đổi ($/t)',data:shfeUsd,borderColor:'#d97706',backgroundColor:'#d97706',borderWidth:1.5,borderDash:[5,4],pointRadius:0,spanGaps:true,tension:.25},
+          {label:`CIF mua thực tế${marketAlloy!=='ALL'?` (${marketAlloy})`:''}`,data:cifPoints,showLine:false,pointRadius:5,pointHoverRadius:7,pointStyle:'rectRot',borderColor:'#16a34a',backgroundColor:'#16a34a'},
+        ]},
+        options:{responsive:true,maintainAspectRatio:false,interaction:{mode:'nearest',intersect:false},
+          plugins:{legend:{position:'bottom',labels:{font:{size:10,weight:'bold'},usePointStyle:true,padding:10}},
+            tooltip:{callbacks:{label:c=>c.raw&&c.raw.spec?`CIF ${fv(c.raw.y)} $/t — ${c.raw.spec}`:`${c.dataset.label}: ${fv(c.parsed.y)} $/t`}}},
+          scales:{x:{ticks:{font:{size:9},maxTicksLimit:14}},y:{ticks:{font:{size:9},callback:v=>fv(v)},title:{display:true,text:'USD/tấn',font:{size:10}}}}}});
+    }catch(err){console.error('Lỗi vẽ biểu đồ thị trường:',err);}
+  },[tab,marketData,allRawImportPrices,marketAlloy]);
   // Ghi danh sách người duyệt lên GitHub
   const saveApprovers=useCallback(async(list)=>{
     const payload={version:1,updatedAt:new Date().toISOString(),approvers:list};
@@ -1002,18 +1062,6 @@ const App=()=>{
     }
   },[ghAPI]);
 
-  // Báo cáo Tồn kho theo tháng: ô điền tay (lưu localStorage)
-  // Cấu trúc: {"03/2026":{tonCuoi:500000000, muaTrongThang:300000000, hmCap:1000000000}, ...}
-  const [monthlyManualData,setMonthlyManualData]=useState(()=>{
-    try{const s=localStorage.getItem('pakd_monthly_manual');return s?JSON.parse(s):{};}catch(e){return {};}
-  });
-  const setMonthlyManualField=useCallback((thang,field,val)=>{
-    setMonthlyManualData(p=>{
-      const next={...p,[thang]:{...(p[thang]||{}),[field]:val}};
-      try{localStorage.setItem('pakd_monthly_manual',JSON.stringify(next));}catch(e){}
-      return next;
-    });
-  },[]);
   const chartRef=useRef(null);const chartInst=useRef(null);
   const setInp=useCallback((f,v)=>setInputs(p=>({...p,[f]:v})),[]);
 
@@ -1159,27 +1207,8 @@ const App=()=>{
       }
       setDbStatus({loading:false,error:statusErr,warn:statusWarn,lastSync:new Date().toLocaleTimeString('vi-VN'),lastSyncAt:Date.now(),source:'gsheet'});
     }catch(e){setDbStatus(p=>({...p,loading:false,error:'Không kết nối được Google Sheet: '+(e.message||'lỗi mạng')}));}
-    // Fetch MonthlyRevenue từ CSV export (async riêng, không block)
-    try{
-      try{const cfText=await fetchText(GSHEET_CASHFLOW);const cfP=parseCashFlowCSV(cfText);if(cfP.length>0)setCashFlowData(cfP);}catch(e){console.warn('CF:',e.message);}
-      const resp=await fetch(GSHEET_MONTHLY_REVENUE);
-      if(resp.ok){
-        const text=await resp.text();
-        const rows=parseCsv(text);
-        // Normalize headers: Thang, MacNhom, SanLuong, DoanhThu, DonGiaBanTB
-        const parsed=rows.filter(r=>Object.values(r).some(v=>v!=='')).map(r=>{
-          const gv2=(keys)=>{for(const k of keys){const norm=k.toLowerCase().replace(/\s+/g,'');const found=Object.entries(r).find(([rk])=>rk.toLowerCase().replace(/\s+/g,'')===norm);if(found&&found[1]!='') return found[1];}return '';};
-          const thang=gv2(['Thang','thang','Tháng','tháng']);
-          const macNhom=gv2(['MacNhom','macnhom','Mác Nhóm','mac nhom','MácNhóm']);
-          const sl=parseFloat((gv2(['SanLuong','sanluong','Sản Lượng','san luong'])||'').replace(/\./g,'').replace(/,/g,'.'))||0;
-          const dt=parseFloat((gv2(['DoanhThu','doanhthu','Doanh Thu','doanh thu'])||'').replace(/\./g,'').replace(/,/g,'.'))||0;
-          const dg=parseFloat((gv2(['DonGiaBanTB','dongiabantb','Đơn Giá Bán TB','don gia ban tb','DonGia','dongia'])||'').replace(/\./g,'').replace(/,/g,'.'))||0;
-          if(!thang||!macNhom) return null;
-          return{thang,macNhom,sanLuong:sl,doanhThu:dt,donGiaBanTB:dg};
-        }).filter(Boolean);
-        if(parsed.length>0) setMonthlyRevenue(parsed);
-      }
-    }catch(e2){console.warn('MonthlyRevenue fetch failed:',e2.message);}
+    // Cashflow CSV (async riêng, không block) — R2: đã bỏ MonthlyRevenue (tab Báo cáo đã xóa)
+    try{const cfText=await fetchText(GSHEET_CASHFLOW);const cfP=parseCashFlowCSV(cfText);if(cfP.length>0)setCashFlowData(cfP);}catch(e){console.warn('CF:',e.message);}
     // SỬA #2 (R6): Sync All cũng tải Lịch sử Sàn từ CLOUD (GitHub /floor/history.json) — chế độ silent (không bật modal).
     if(which==='all'){
       try{ await loadFloorHistoryFromGithub(true); }catch(e3){console.warn('Floor history cloud:',e3.message);}
@@ -1233,7 +1262,6 @@ const App=()=>{
   // Sync resultRef cho callbacks GitHub không vi phạm TDZ
   useEffect(()=>{resultRef.current=result;},[result]);
 
-  const reportData=useMemo(()=>calcAlloySummary(inventory,result?result.finPerKg:0,inputs,result?result.rows:[]),[inventory,result,inputs]);
   const limitsWarnings=useMemo(()=>calcLimitsWarnings(limitsData,inventory),[limitsData,inventory]);
 
   // ── PO đã ký: gom tổng "chưa giao" theo SKU key chuẩn hóa ──
@@ -1886,10 +1914,10 @@ URL.revokeObjectURL(url);
             {k:'cashflow',l:'💰 Dòng Tiền'},
             {k:'po',l:poData.length>0?`📑 PO (${poData.length})`:'📑 PO đã ký'},
             {k:'floorhistory',l:'🗓️ Lịch sử Sàn'},
-            {k:'report',l:limitsWarnings.totalAlerts>0?`📈 BC ⚠${limitsWarnings.totalAlerts}`:'📈 Báo cáo'},
+            {k:'market',l:'📈 Thị trường'},
           ].map(t=>(
             <button key={t.k} onClick={()=>setTab(t.k)} className={`nav-tab ${tab===t.k?'on':''}`}
-              style={t.k==='report'&&limitsWarnings.totalAlerts>0?{color:'#dc2626',borderColor:'#fca5a5'}:t.k==='floor'&&tab!=='floor'?{color:'#0d9488'}:t.k==='cashflow'&&tab!=='cashflow'?{color:'#7c3aed'}:{}}>
+              style={t.k==='market'&&tab!=='market'?{color:'#0891b2'}:t.k==='floor'&&tab!=='floor'?{color:'#0d9488'}:t.k==='cashflow'&&tab!=='cashflow'?{color:'#7c3aed'}:{}}>
               {t.l}
             </button>
           ))}
@@ -2641,67 +2669,6 @@ URL.revokeObjectURL(url);
           <div style={{flex:1,padding:'14px 18px',overflowY:'auto',background:bg1}}>
             <div style={{maxWidth:'1600px',margin:'0 auto'}}>
 
-              {/* GĐ3a: GIÁ THỊ TRƯỜNG — LME / SHFE / SMM + tỷ giá, tự kéo hằng ngày 12h */}
-              {gasConfig.url&&(()=>{
-                const mk=marketData[0]||null;
-                const mkPrev=marketData[1]||null;
-                const num=v=>{const f=parseFloat(v);return isNaN(f)?null:f;};
-                const smmUsd=mk?num(mk.smm_usd):null;
-                const bench=smmUsd!=null?smmUsd+(parseFloat(marketCfg.premium)||0):null;
-                const arrow=(cur,prev)=>{if(cur==null||prev==null)return '';return cur>prev?' ▲':cur<prev?' ▼':' =';};
-                const cifRows=bench!=null?updatedImportPrices.filter(u=>num(u.priceFC)>0).map(u=>{
-                  const cif=num(u.priceFC);const diff=(cif-bench)/bench*100;
-                  return {label:`${u.alloy} ${u.temper} ${u.minThick}-${u.maxThick}mm`,cif,diff};
-                }).sort((x,y)=>y.diff-x.diff):[];
-                const nOver=cifRows.filter(r=>r.diff>(parseFloat(marketCfg.alertPct)||3)).length;
-                return (
-                  <div className="card" style={{marginBottom:12,padding:'10px 14px',border:nOver>0?'2px solid #fca5a5':undefined}}>
-                    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:8}}>
-                      <div style={{fontWeight:900,fontSize:'.85rem',color:'#0f172a'}}>📈 Giá thị trường {mk?<span style={{fontSize:'.66rem',color:'#64748b',fontWeight:700}}>· {mk.date} (tự kéo 12h trưa)</span>:null}</div>
-                      <div style={{display:'flex',gap:6,alignItems:'center',fontSize:'.66rem',fontWeight:700,color:'#475569'}}>
-                        Premium <input className="inp inp-xs" style={{width:62}} type="number" value={marketCfg.premium} onChange={e=>saveMarketCfg({...marketCfg,premium:e.target.value})} title="Phí gia công tấm/cuộn + cước về VN cộng vào giá SMM thỏi (USD/tấn)"/> $/t
-                        · Ngưỡng <input className="inp inp-xs" style={{width:44}} type="number" value={marketCfg.alertPct} onChange={e=>saveMarketCfg({...marketCfg,alertPct:e.target.value})}/> %
-                        <button className="btn btn-ghost btn-sm" onClick={loadMarket} style={{padding:'1px 7px',fontSize:'.64rem'}}><Ic.Refresh/> Tải lại</button>
-                      </div>
-                    </div>
-                    {!mk?(
-                      <div style={{fontSize:'.7rem',color:'#b45309',fontWeight:700,marginTop:6}}>{marketErr?`⚠ Lỗi đọc giá: ${marketErr}`:'⚠ Chưa có dữ liệu — trong Apps Script chạy tay hàm fetchMarketPrices 1 lần (sau đó tự chạy 12h trưa hằng ngày).'}</div>
-                    ):(
-                      <>
-                        <div style={{display:'flex',gap:10,flexWrap:'wrap',marginTop:8}}>
-                          {[
-                            {l:'LME cash',v:num(mk.lme_usd),u:'$/t',p:mkPrev?num(mkPrev.lme_usd):null},
-                            {l:'SHFE',v:num(mk.shfe_cny),u:'¥/t',p:mkPrev?num(mkPrev.shfe_cny):null},
-                            {l:'SMM A00',v:num(mk.smm_cny),u:'¥/t',p:mkPrev?num(mkPrev.smm_cny):null},
-                            {l:'SMM quy đổi',v:smmUsd,u:'$/t',p:mkPrev?num(mkPrev.smm_usd):null},
-                            {l:'USD/VND',v:num(mk.usd_vnd),u:'',p:mkPrev?num(mkPrev.usd_vnd):null},
-                            {l:'CNY/VND',v:num(mk.cny_vnd),u:'',p:mkPrev?num(mkPrev.cny_vnd):null},
-                          ].map((b,i)=>(
-                            <div key={i} style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:6,padding:'5px 10px',minWidth:104}}>
-                              <div style={{fontSize:'.6rem',fontWeight:800,color:'#64748b'}}>{b.l}</div>
-                              <div className="mono" style={{fontSize:'.84rem',fontWeight:900,color:b.p!=null&&b.v!=null?(b.v>b.p?'#dc2626':b.v<b.p?'#16a34a':'#0f172a'):'#0f172a'}}>{b.v!=null?fv(b.v):'—'}{b.u?` ${b.u}`:''}<span style={{fontSize:'.62rem'}}>{arrow(b.v,b.p)}</span></div>
-                            </div>
-                          ))}
-                        </div>
-                        {bench!=null&&cifRows.length>0&&(
-                          <div style={{marginTop:8,borderTop:'1px dashed #e2e8f0',paddingTop:7}}>
-                            <span style={{fontSize:'.66rem',fontWeight:800,color:nOver>0?'#b91c1c':'#475569'}}>
-                              {nOver>0?`🔴 ${nOver} giá CIF chào cao hơn thị trường >${marketCfg.alertPct}%`:'✓ Giá CIF chào đang trong vùng hợp lý so với SMM quy đổi + premium'}
-                              <span style={{fontWeight:700,color:'#64748b'}}> (chuẩn so sánh: {fv(bench)} $/t)</span>
-                            </span>
-                            <div style={{display:'flex',gap:6,flexWrap:'wrap',marginTop:5}}>
-                              {cifRows.slice(0,8).map((r,i)=>(
-                                <span key={i} className="mono" style={{fontSize:'.62rem',fontWeight:800,borderRadius:4,padding:'2px 7px',background:r.diff>(parseFloat(marketCfg.alertPct)||3)?'#fee2e2':'#f0fdf4',color:r.diff>(parseFloat(marketCfg.alertPct)||3)?'#b91c1c':'#15803d'}}>{r.label}: {fv(r.cif)}$ ({r.diff>=0?'+':''}{r.diff.toFixed(1)}%)</span>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-                      </>
-                    )}
-                  </div>
-                );
-              })()}
-
               {/* HEADER + VIEWS */}
               <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:12}}>
                 <div>
@@ -3212,474 +3179,96 @@ URL.revokeObjectURL(url);
         )}
 
         {/* ════ TAB BÁO CÁO ════ */}
-        {tab==='report'&&(()=>{
-          const TARGET_ALLOYS=['A1050','A3003','A5052'];
-          const allMonths=[...new Set(monthlyRevenue.map(r=>r.thang))].sort((a,b)=>b.localeCompare(a));
-          const last3Months=allMonths.slice(0,3);
-          const getRevForAlloyMonth=(alloy,thang)=>{
-            const rows=monthlyRevenue.filter(r=>r.thang===thang&&r.macNhom&&r.macNhom.toUpperCase().includes(alloy.replace('A','')));
-            const sl=rows.reduce((s,r)=>s+r.sanLuong,0);
-            const dt=rows.reduce((s,r)=>s+r.doanhThu,0);
-            return{sanLuong:sl,doanhThu:dt,donGia:sl>0?rows.reduce((s,r)=>s+r.sanLuong*(r.donGiaBanTB||0),0)/sl:0};
-          };
-          const getAlloyStock=(alloy)=>{
-            const inStock=inventory.filter(r=>r.alloy===alloy&&r.status==='IN_STOCK');
-            const inTransit=inventory.filter(r=>r.alloy===alloy&&r.status==='IN_TRANSIT');
-            const qtyStock=inStock.reduce((s,r)=>s+(parseFloat(r.qtyKg)||0),0);
-            const valStock=inStock.reduce((s,r)=>s+(parseFloat(r.qtyKg)||0)*(parseFloat(r.avgCost)||0),0);
-            const qtyTransit=inTransit.reduce((s,r)=>s+(parseFloat(r.qtyKg)||0),0);
-            const valTransit=inTransit.reduce((s,r)=>s+(parseFloat(r.qtyKg)||0)*(parseFloat(r.avgCost)||0),0);
-            return{qtyStock,valStock,qtyTransit,valTransit};
-          };
-          const getAlloyStockAlert=(alloy)=>{
-            const {qtyStock,qtyTransit}=getAlloyStock(alloy);
-            const total=qtyStock+qtyTransit;
-            const msRows=minStockRows.filter(r=>r.alloy===alloy);
-            const totalMin=msRows.reduce((s,r)=>s+(parseFloat(r.minStockKg)||0),0);
-            const totalMax=msRows.reduce((s,r)=>s+(r.maxStockKg?parseFloat(r.maxStockKg):0),0);
-            // Tính từng SKU: dư và thiếu KHÔNG bù trừ nhau
-            let tongDu=0, tongThieu=0;
-            const skuDetails=[];
-            const skuGroups=groupBySku(inventory.filter(r=>r.alloy===alloy));
-            msRows.forEach(ms=>{
-              const k=skuKey(ms);
-              const grp=skuGroups.find(g=>g.key===k);
-              const cur=grp?[...grp.inStock,...grp.inTransit].reduce((s,r)=>s+(parseFloat(r.qtyKg)||0),0):0;
-              const min=parseFloat(ms.minStockKg)||0;
-              const max=ms.maxStockKg?parseFloat(ms.maxStockKg):null;
-              const delta=min>0?cur-min:null;
-              const isOverMax=max!==null&&cur>max;
-              if(isOverMax) tongDu+=cur-(max||0);
-              else if(delta!==null&&delta<0) tongThieu+=Math.abs(delta);
-              else if(delta!==null&&delta>0&&!isOverMax) tongDu+=delta;
-              skuDetails.push({k,cur,min,max,delta,isOverMax});
-            });
-            const isOver=totalMax>0&&total>totalMax;
-            const isLow=tongThieu>0;
-            const isNear=!isLow&&totalMin>0&&total>=totalMin*0.8&&total<totalMin;
-            return{total,totalMin,totalMax,tongDu,tongThieu,isOver,isLow,isNear,skuDetails};
-          };
-          const getStockCoeff=(alloy)=>{
-            const {qtyStock,valStock,qtyTransit,valTransit}=getAlloyStock(alloy);
-            const total=qtyStock+qtyTransit;
-            const totalVal=valStock+valTransit;
-            // hệ số tồn = tồn tháng này / SL hoặc DT từng tháng (không BQ)
-            return{total,totalVal};
-          };
-
-          return(
+        {tab==='market'&&(
           <div style={{flex:1,padding:'18px',overflowY:'auto',background:bg1}}>
-            <div style={{maxWidth:'1340px',margin:'0 auto'}}>
-              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:14}}>
-                <h2 style={{fontWeight:900,fontSize:'1.05rem',color:'#0f172a'}}>📈 Báo cáo Tồn kho & Doanh thu</h2>
-                <div style={{display:'flex',gap:8}}>
-                  <button className="btn btn-purple btn-sm" onClick={()=>syncGoogleSheet('lim')} disabled={dbStatus.loading||!ghVerified}><Ic.Refresh/> Sync Hạn mức</button>
-                  <button className="btn btn-ghost btn-sm" onClick={()=>syncGoogleSheet('all')} disabled={dbStatus.loading||!ghVerified}><Ic.Refresh/> Sync All</button>
+            <div style={{maxWidth:'1300px',margin:'0 auto'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:12,flexWrap:'wrap',gap:8}}>
+                <div>
+                  <h2 style={{fontWeight:900,fontSize:'1.05rem',color:'#0f172a'}}>📈 Thị trường & Lịch sử CIF</h2>
+                  <p style={{fontSize:'.72rem',color:'#475569',fontWeight:600,marginTop:2}}>SMM A00 · LME · SHFE quy về USD/tấn + các đợt CIF phòng mua đã nhập — khoảng hở SMM↔CIF = premium NCC đang tính</p>
+                </div>
+                <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                  {marketData[0]&&<span className="tag tg" style={{fontSize:'.66rem'}}>✓ Giá ngày {marketData[0].date}</span>}
+                  <button className="btn btn-ghost btn-sm" onClick={loadMarket}><Ic.Refresh/> Tải lại giá</button>
                 </div>
               </div>
 
-              {/* ══════════ KHỐI 🌐 TOÀN KHO ══════════ */}
-              <div style={{background:'#ffffff',border:'2px solid #bfdbfe',borderRadius:12,padding:'16px 20px',marginBottom:16,boxShadow:'0 2px 8px rgba(0,0,0,0.07)'}}>
-                <div style={{fontSize:'.72rem',color:'#1d4ed8',fontWeight:900,textTransform:'uppercase',letterSpacing:'.08em',marginBottom:14,display:'flex',alignItems:'center',gap:8}}>
-                  🌐 TOÀN KHO — TỔNG QUAN NHANH
-                  {monthlyRevenue.length===0&&<span style={{fontSize:'.65rem',color:'#b45309',fontWeight:700,background:'#fef3c7',border:'1px solid #fde047',borderRadius:4,padding:'2px 8px'}}>⚠ Chưa có DT — nhấn Sync All</span>}
+              {marketData.length===0?(
+                <div className="card" style={{textAlign:'center',padding:44}}>
+                  <div style={{fontSize:'2rem',marginBottom:8}}>📈</div>
+                  <div style={{color:'#64748b',fontWeight:700}}>{marketErr?`⚠ Lỗi đọc giá: ${marketErr}`:'Chưa có dữ liệu giá thị trường'}</div>
+                  <div style={{color:'#94a3b8',fontSize:'.75rem',marginTop:4}}>Trong Apps Script chạy <strong>fetchMarketPrices</strong> (giá hôm nay) và <strong>backfillMarketHistory</strong> (nạp lịch sử các ngày trước) rồi bấm Tải lại.</div>
                 </div>
-
-                {/* ROW 1: KPI toàn kho — Tổng KL & Vốn tồn kho (chi tiết Trong kho / Đi đường) */}
-                {(()=>{
-                  const stockKg=reportData.stockKg||0;
-                  const transitKg=reportData.transitKg||0;
-                  const totalKg=stockKg+transitKg;
-                  const stockVal=reportData.stockCostValue||0;
-                  const transitValRaw=reportData.transitCostValue||0;
-                  const transitValAdj=transitValRaw*0.9; // Đi đường x 0.9 theo yêu cầu giám đốc
-                  const totalValAdj=stockVal+transitValAdj;
-                  return(
-                  <div style={{display:'grid',gridTemplateColumns:'repeat(2,1fr)',gap:10,marginBottom:14}}>
-                    {/* THẺ 1: TỔNG KL TỒN KHO */}
-                    <div style={{background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:8,padding:'10px 13px'}}>
-                      <div style={{fontSize:'.66rem',color:'#475569',fontWeight:800,marginBottom:6,textTransform:'uppercase',letterSpacing:'.04em'}}>📦 Tổng KL tồn kho</div>
-                      <div className="mono" style={{fontSize:'1.15rem',fontWeight:900,color:'#15803d',marginBottom:6}}>{fv(totalKg)} kg</div>
-                      <div style={{borderTop:'1px solid #bbf7d0',paddingTop:5,display:'flex',flexDirection:'column',gap:3}}>
-                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-                          <span style={{fontSize:'.62rem',fontWeight:700,color:'#15803d'}}>🟢 Trong kho</span>
-                          <span className="mono" style={{fontSize:'.78rem',fontWeight:900,color:'#15803d'}}>{fv(stockKg)} kg</span>
-                        </div>
-                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-                          <span style={{fontSize:'.62rem',fontWeight:700,color:'#b45309'}}>🟡 Đi đường</span>
-                          <span className="mono" style={{fontSize:'.78rem',fontWeight:900,color:'#b45309'}}>{fv(transitKg)} kg</span>
-                        </div>
-                      </div>
-                    </div>
-                    {/* THẺ 2: TỔNG VỐN TỒN KHO */}
-                    <div style={{background:'#eff6ff',border:'1px solid #bfdbfe',borderRadius:8,padding:'10px 13px'}}>
-                      <div style={{fontSize:'.66rem',color:'#475569',fontWeight:800,marginBottom:6,textTransform:'uppercase',letterSpacing:'.04em'}}>💰 Tổng vốn tồn kho</div>
-                      <div className="mono" style={{fontSize:'1.15rem',fontWeight:900,color:'#1d4ed8',marginBottom:6}}>{fv(totalValAdj)}đ</div>
-                      <div style={{borderTop:'1px solid #bfdbfe',paddingTop:5,display:'flex',flexDirection:'column',gap:3}}>
-                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-                          <span style={{fontSize:'.62rem',fontWeight:700,color:'#1d4ed8'}}>🟢 Vốn trong kho</span>
-                          <span className="mono" style={{fontSize:'.78rem',fontWeight:900,color:'#1d4ed8'}}>{fv(stockVal)}đ</span>
-                        </div>
-                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-                          <span style={{fontSize:'.62rem',fontWeight:700,color:'#b45309'}}>🟡 Vốn đi đường (×0.9)</span>
-                          <span className="mono" style={{fontSize:'.78rem',fontWeight:900,color:'#b45309'}}>{fv(transitValAdj)}đ</span>
-                        </div>
-                        <div style={{fontSize:'.55rem',fontStyle:'italic',color:'#64748b',marginTop:2,lineHeight:1.4}}>
-                          * Hàng đi đường nhân hệ số 0.9 do chưa về kho, giảm rủi ro định giá. Vốn gốc đi đường: {fv(transitValRaw)}đ
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                  );
-                })()}
-
-                {/* ROW 1b: TỔNG DOANH THU NHÔM (A1050+A3003+A5052) — 3 cột: T hiện tại | T-1 | T-2 */}
-                {(()=>{
-                  // Lấy tháng hiện tại theo định dạng MM/YYYY (giống dữ liệu trong GSheet)
-                  const now=new Date();
-                  const curMonthLabel=`${String(now.getMonth()+1).padStart(2,'0')}/${now.getFullYear()}`;
-                  // 2 tháng gần nhất đã có dữ liệu (loại tháng hiện tại nếu trùng)
-                  const closedMonths=allMonths.filter(m=>m!==curMonthLabel).slice(0,2);
-                  // displayMonths: [T hiện tại, T-1, T-2]
-                  const displayMonths=[curMonthLabel,...closedMonths];
-                  if(displayMonths.filter(Boolean).length===0) return null;
-                  // Helper: trích M/YYYY từ chuỗi "Tháng 3/2026" hoặc "Tháng 03/2026"
-                  const parseThangLabel=(s)=>{
-                    if(!s) return null;
-                    const m=String(s).match(/(\d{1,2})\s*[\/\-]\s*(\d{4})/);
-                    if(!m) return null;
-                    return `${String(parseInt(m[1])).padStart(2,'0')}/${m[2]}`;
-                  };
-                  // Gộp CashFlow theo tháng: trả về {"03/2026":{tongThu,tongMua}, ...}
-                  const cfByMonth={};
-                  (cashFlowData||[]).forEach(r=>{
-                    const key=parseThangLabel(r.thang);
-                    if(!key) return;
-                    if(!cfByMonth[key]) cfByMonth[key]={tongThu:0,tongMua:0,hasData:false};
-                    if(r.tongThu!=null){cfByMonth[key].tongThu+=r.tongThu;cfByMonth[key].hasData=true;}
-                    if(r.tongMua!=null){cfByMonth[key].tongMua+=r.tongMua;cfByMonth[key].hasData=true;}
-                  });
-                  // Tính KPI từng tháng
-                  const totals=displayMonths.map(m=>{
-                    if(!m) return null;
-                    let sl=0,dt=0;
-                    TARGET_ALLOYS.forEach(al=>{
-                      const rv=getRevForAlloyMonth(al,m);
-                      sl+=rv.sanLuong; dt+=rv.doanhThu;
-                    });
-                    const donGia=sl>0?dt/sl:0;
-                    // Tự động lấy Tổng thu & Tổng mua trong tháng từ CashFlow (gộp các tuần)
-                    const cf=cfByMonth[m]||{tongThu:0,tongMua:0,hasData:false};
-                    const tongThu=cf.tongThu||0;
-                    const tongMua=cf.tongMua||0;
-                    // Kết chuyển sang T+1 = Tổng thu − Tổng nhu cầu mua trong tháng
-                    const ketChuyen=cf.hasData?(tongThu-tongMua):0;
-                    return{m,sl,dt,donGia,tongThu,tongMua,ketChuyen,hasCFData:cf.hasData};
-                  });
-                  // % chênh lệch so với tháng trước (kế tiếp trong mảng)
-                  const pctChange=(cur,prev)=>(prev&&prev>0&&cur>0)?((cur-prev)/prev*100):null;
-                  return(
-                  <div style={{background:'#f0f4ff',border:'2px solid #a5b4fc',borderRadius:9,padding:'11px 14px',marginBottom:14}}>
-                    <div style={{fontSize:'.68rem',color:'#3730a3',fontWeight:900,marginBottom:10,display:'flex',alignItems:'center',gap:6,flexWrap:'wrap'}}>
-                      📊 TỔNG DOANH THU NHÔM (A1050 + A3003 + A5052) — 3 tháng gần nhất
-                      <span style={{fontSize:'.6rem',color:'#6366f1',fontWeight:700,background:'#e0e7ff',borderRadius:3,padding:'1px 7px'}}>T hiện tại · T-1 · T-2</span>
-                      <span style={{fontSize:'.58rem',color:'#065f46',fontWeight:600,background:'#d1fae5',borderRadius:3,padding:'1px 6px'}}>🔗 Kết chuyển HM tự tính từ CashFlow</span>
-                    </div>
-                    <div style={{display:'grid',gridTemplateColumns:`repeat(${totals.length},1fr)`,gap:9}}>
-                      {totals.map((t,ti)=>{
-                        if(!t) return <div key={ti}/>;
-                        const isCur=ti===0;
-                        const prev=totals[ti+1];
-                        const dtPct=isCur||!prev?null:pctChange(t.dt,prev?.dt);
-                        const dgPct=isCur||!prev?null:pctChange(t.donGia,prev?.donGia);
-                        // For current month, compare with closest closed month
-                        const curDtPct=isCur?pctChange(t.dt,totals[1]?.dt):null;
-                        const curDgPct=isCur?pctChange(t.donGia,totals[1]?.donGia):null;
-                        const showDtPct=isCur?curDtPct:dtPct;
-                        const showDgPct=isCur?curDgPct:dgPct;
-                        return(
-                        <div key={ti} style={{background:isCur?'#fef9c3':'#ffffff',border:`2px solid ${isCur?'#facc15':'#c7d2fe'}`,borderRadius:7,padding:'9px 11px',display:'flex',flexDirection:'column',gap:6}}>
-                          {/* Header */}
-                          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-                            <span style={{fontWeight:900,fontSize:'.78rem',color:isCur?'#854d0e':'#3730a3'}}>{t.m}</span>
-                            {isCur
-                              ?<span style={{fontSize:'.55rem',color:'#854d0e',fontWeight:800,background:'#fde68a',borderRadius:3,padding:'1px 5px'}}>DT CẬP NHẬT ĐẾN HÔM NAY</span>
-                              :ti===1?<span style={{fontSize:'.55rem',color:'#4f46e5',fontWeight:700,background:'#c7d2fe',borderRadius:3,padding:'1px 5px'}}>Tháng trước</span>
-                              :<span style={{fontSize:'.55rem',color:'#64748b',fontWeight:700,background:'#e2e8f0',borderRadius:3,padding:'1px 5px'}}>T-2</span>}
-                          </div>
-                          {/* KPI: Sản lượng / Doanh thu / Đơn giá BQ */}
-                          <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:5}}>
-                            <div>
-                              <div style={{fontSize:'.55rem',color:'#64748b',fontWeight:600}}>Sản lượng</div>
-                              <div className="mono" style={{fontSize:'.78rem',fontWeight:900,color:'#15803d'}}>{t.sl>0?fv(t.sl)+' kg':'—'}</div>
-                            </div>
-                            <div>
-                              <div style={{fontSize:'.55rem',color:'#64748b',fontWeight:600}}>Doanh thu</div>
-                              <div className="mono" style={{fontSize:'.78rem',fontWeight:900,color:'#1d4ed8'}}>{t.dt>0?fv(t.dt)+'đ':'—'}</div>
-                              {showDtPct!==null&&!isNaN(showDtPct)&&<div style={{fontSize:'.58rem',fontWeight:800,color:showDtPct>=0?'#15803d':'#dc2626'}}>{showDtPct>=0?'▲':'▼'} {Math.abs(showDtPct).toFixed(1)}%</div>}
-                            </div>
-                            <div>
-                              <div style={{fontSize:'.55rem',color:'#64748b',fontWeight:600}}>Đơn giá BQ</div>
-                              <div className="mono" style={{fontSize:'.78rem',fontWeight:800,color:'#854d0e'}}>{t.donGia>0?fv(t.donGia)+'đ':'—'}</div>
-                              {showDgPct!==null&&!isNaN(showDgPct)&&<div style={{fontSize:'.58rem',fontWeight:800,color:showDgPct>=0?'#15803d':'#dc2626'}}>{showDgPct>=0?'▲':'▼'} {Math.abs(showDgPct).toFixed(1)}%</div>}
-                            </div>
-                            <div>
-                              <div style={{fontSize:'.55rem',color:'#64748b',fontWeight:600}}>Hệ số SL/DT</div>
-                              <div className="mono" style={{fontSize:'.65rem',fontWeight:700,color:'#475569'}}>
-                                {t.sl>0?(reportData.globalKg/t.sl).toFixed(2)+'×':'—'}
-                                {' / '}
-                                {t.dt>0?(reportData.globalCostValue/t.dt).toFixed(2)+'×':'—'}
-                              </div>
-                            </div>
-                          </div>
-                          {/* Tự động: Tổng thu + Tổng nhu cầu mua + Kết chuyển HM (lấy từ CashFlow) */}
-                          <div style={{borderTop:'1px dashed '+(isCur?'#facc15':'#c7d2fe'),paddingTop:6,display:'flex',flexDirection:'column',gap:3}}>
-                            {!t.hasCFData?(
-                              <div style={{fontSize:'.58rem',color:'#92400e',fontWeight:700,background:'#fef3c7',border:'1px solid #fde047',borderRadius:4,padding:'4px 7px'}}>
-                                ⚠ Chưa có dữ liệu CashFlow tháng {t.m} – nhấn <strong>Sync CF</strong> ở tab Dòng Tiền
-                              </div>
-                            ):(
-                            <>
-                              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'#ecfdf5',border:'1px solid #a7f3d0',borderRadius:4,padding:'3px 7px'}}>
-                                <span style={{fontSize:'.58rem',fontWeight:700,color:'#065f46'}}>💰 Tổng thu</span>
-                                <span className="mono" style={{fontSize:'.72rem',fontWeight:900,color:'#065f46'}}>{t.tongThu>0?fv(t.tongThu)+'đ':'—'}</span>
-                              </div>
-                              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'#fef2f2',border:'1px solid #fecaca',borderRadius:4,padding:'3px 7px'}}>
-                                <span style={{fontSize:'.58rem',fontWeight:700,color:'#991b1b'}}>🛒 Tổng nhu cầu mua</span>
-                                <span className="mono" style={{fontSize:'.72rem',fontWeight:900,color:'#991b1b'}}>{t.tongMua>0?fv(t.tongMua)+'đ':'—'}</span>
-                              </div>
-                              <div style={{background:t.ketChuyen>=0?'#dcfce7':'#fee2e2',border:'1px solid '+(t.ketChuyen>=0?'#86efac':'#fca5a5'),borderRadius:4,padding:'4px 8px',marginTop:2}}>
-                                <div style={{fontSize:'.53rem',fontWeight:800,color:t.ketChuyen>=0?'#14532d':'#991b1b',textTransform:'uppercase',letterSpacing:'.04em',display:'flex',justifyContent:'space-between'}}>
-                                  <span>↪ Kết chuyển sang T+1</span>
-                                  <span style={{fontStyle:'italic',opacity:.75}}>= Thu − Mua</span>
-                                </div>
-                                <div className="mono" style={{fontSize:'.78rem',fontWeight:900,color:t.ketChuyen>=0?'#14532d':'#991b1b'}}>
-                                  {t.ketChuyen>=0?'+':''}{fv(t.ketChuyen)}đ
-                                </div>
-                              </div>
-                            </>
-                            )}
-                          </div>
-                        </div>
-                        );
-                      })}
-                    </div>
-                    {/* Tổng kết Kết chuyển từ tháng trước → cộng vào HM hiệu lực tháng hiện tại */}
-                    {totals[0]&&totals[1]&&totals[1].hasCFData&&(
-                      <div style={{marginTop:10,background:totals[1].ketChuyen>=0?'#fef3c7':'#fee2e2',border:'1px solid '+(totals[1].ketChuyen>=0?'#fcd34d':'#fca5a5'),borderRadius:6,padding:'8px 12px',fontSize:'.72rem',fontWeight:700,color:totals[1].ketChuyen>=0?'#854d0e':'#991b1b'}}>
-                        ⚡ <strong>Kết chuyển từ {totals[1].m} sang {totals[0].m}:</strong> <span className="mono" style={{fontWeight:900,color:totals[1].ketChuyen>=0?'#15803d':'#991b1b',marginLeft:4}}>{totals[1].ketChuyen>=0?'+':''}{fv(totals[1].ketChuyen)}đ</span>
-                        <div style={{fontSize:'.62rem',fontWeight:600,marginTop:3,color:'#475569'}}>
-                          = Tổng thu {totals[1].m} ({fv(totals[1].tongThu)}đ) − Tổng nhu cầu mua {totals[1].m} ({fv(totals[1].tongMua)}đ).
-                          {totals[1].ketChuyen>=0?' Phần dư này sẽ cộng vào HM hiệu lực tháng hiện tại.':' Phần thiếu này sẽ trừ vào HM hiệu lực tháng hiện tại.'}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                  );
-                })()}
-
-                {/* ROW 2: BẢNG CHI TIẾT A1050 / A3003 / A5052 — mỗi mác 1 block dọc */}
-                <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:12,marginBottom:14}}>
-                  {TARGET_ALLOYS.map(alloy=>{
-                    const {qtyStock,valStock,qtyTransit,valTransit}=getAlloyStock(alloy);
-                    const alert=getAlloyStockAlert(alloy);
-                    const {totalVal}=getStockCoeff(alloy);
-                    const g=reportData.alloyStats.find(x=>x.alloy===alloy)||{avgBefore:0,avgAfter:0,plainKg:0,coatedKg:0,plainCostValue:0,coatedCostValue:0};
-                    let borderColor='#cbd5e1',headerBg='#f1f5f9',headerC='#334155';
-                    let alertTag=null;
-                    const hasDu=alert.tongDu>0;
-                    const hasThieu=alert.tongThieu>0;
-                    if(hasDu&&hasThieu){
-                      // Vừa có dư vừa có thiếu ở các SKU khác nhau
-                      borderColor='#f97316';headerBg='#fff7ed';headerC='#9a3412';
-                      alertTag=<div style={{display:'flex',gap:4,flexWrap:'wrap'}}>
-                        <span style={{background:'#fee2e2',color:'#b91c1c',border:'1px solid #fca5a5',borderRadius:4,padding:'1px 6px',fontSize:'.62rem',fontWeight:900}}>🔴 Thiếu {fv(alert.tongThieu)}kg</span>
-                        <span style={{background:'#f3e8ff',color:'#6d28d9',border:'1px solid #d8b4fe',borderRadius:4,padding:'1px 6px',fontSize:'.62rem',fontWeight:900}}>🟣 Dư {fv(alert.tongDu)}kg</span>
-                      </div>;
-                    } else if(hasThieu){
-                      borderColor='#fca5a5';headerBg='#fef2f2';headerC='#991b1b';
-                      alertTag=<span style={{background:'#fee2e2',color:'#b91c1c',border:'1px solid #fca5a5',borderRadius:4,padding:'2px 8px',fontSize:'.67rem',fontWeight:900}}>🔴 THIẾU {fv(alert.tongThieu)}kg</span>;
-                    } else if(hasDu){
-                      borderColor='#d8b4fe';headerBg='#f3e8ff';headerC='#581c87';
-                      alertTag=<span style={{background:'#f3e8ff',color:'#6d28d9',border:'1px solid #d8b4fe',borderRadius:4,padding:'2px 8px',fontSize:'.67rem',fontWeight:900}}>🟣 DƯ {fv(alert.tongDu)}kg</span>;
-                    } else if(alert.isNear){
-                      borderColor='#fdba74';headerBg='#fff7ed';headerC='#92400e';
-                      alertTag=<span style={{background:'#ffedd5',color:'#9a3412',border:'1px solid #fdba74',borderRadius:4,padding:'2px 8px',fontSize:'.67rem',fontWeight:900}}>🟡 SẮP THIẾU</span>;
-                    } else if(alert.totalMin>0){
-                      alertTag=<span style={{background:'#dcfce7',color:'#14532d',border:'1px solid #86efac',borderRadius:4,padding:'2px 8px',fontSize:'.67rem',fontWeight:900}}>✓ ĐỦ KẾ HOẠCH</span>;
-                    }
-                    return(
-                    <div key={alloy} style={{border:`2px solid ${borderColor}`,borderRadius:10,overflow:'hidden',boxShadow:'0 1px 4px rgba(0,0,0,0.07)'}}>
-                      {/* Header mác */}
-                      <div style={{background:headerBg,padding:'8px 13px',display:'flex',justifyContent:'space-between',alignItems:'center',borderBottom:`1px solid ${borderColor}`}}>
-                        <span style={{fontWeight:900,fontSize:'1rem',color:headerC}}>{alloy}</span>
-                        {alertTag}
-                      </div>
-                      <div style={{padding:'10px 12px',display:'flex',flexDirection:'column',gap:8}}>
-                        {/* Tồn: Trong kho + Đi đường */}
-                        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:6}}>
-                          <div style={{background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:6,padding:'7px 10px'}}>
-                            <div style={{fontSize:'.6rem',fontWeight:800,color:'#15803d',marginBottom:3}}>🟢 Trong kho</div>
-                            <div className="mono" style={{fontSize:'.92rem',fontWeight:900,color:'#15803d'}}>{fv(qtyStock)}<span style={{fontSize:'.65rem',marginLeft:3,fontWeight:600}}>kg</span></div>
-                            <div className="mono" style={{fontSize:'.7rem',fontWeight:700,color:'#16a34a',marginTop:2}}>{fv(valStock)}<span style={{fontSize:'.6rem',marginLeft:1}}>đ</span></div>
-                          </div>
-                          <div style={{background:'#fefce8',border:'1px solid #fef08a',borderRadius:6,padding:'7px 10px'}}>
-                            <div style={{fontSize:'.6rem',fontWeight:800,color:'#854d0e',marginBottom:3}}>🟡 Đi đường</div>
-                            <div className="mono" style={{fontSize:'.92rem',fontWeight:900,color:'#d97706'}}>{fv(qtyTransit)}<span style={{fontSize:'.65rem',marginLeft:3,fontWeight:600}}>kg</span></div>
-                            <div className="mono" style={{fontSize:'.7rem',fontWeight:700,color:'#b45309',marginTop:2}}>{fv(valTransit)}<span style={{fontSize:'.6rem',marginLeft:1}}>đ</span></div>
-                          </div>
-                        </div>
-                        {/* GV + PE/NOPE */}
-                        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr 1fr',gap:5}}>
-                          <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:5,padding:'5px 7px'}}>
-                            <div style={{fontSize:'.55rem',color:'#64748b',fontWeight:700}}>GV BQ HT</div>
-                            <div className="mono" style={{fontSize:'.78rem',fontWeight:800,color:'#334155'}}>{fv(g.avgBefore)}</div>
-                          </div>
-                          <div style={{background:'#eff6ff',border:'1px solid #bfdbfe',borderRadius:5,padding:'5px 7px'}}>
-                            <div style={{fontSize:'.55rem',color:'#1d4ed8',fontWeight:700}}>GV sau nhập</div>
-                            <div className="mono" style={{fontSize:'.78rem',fontWeight:800,color:g.avgAfter>g.avgBefore?'#dc2626':'#1d4ed8'}}>{fv(g.avgAfter)}</div>
-                          </div>
-                          <div style={{background:'#fef08a',border:'1px solid #fde047',borderRadius:5,padding:'5px 7px'}}>
-                            <div style={{fontSize:'.55rem',color:'#854d0e',fontWeight:700}}>⬜ NOPE</div>
-                            <div className="mono" style={{fontSize:'.72rem',fontWeight:800,color:'#a16207'}}>{fv(g.plainKg)} kg</div>
-                            <div className="mono" style={{fontSize:'.65rem',color:'#a16207',fontWeight:600}}>{fv(g.plainCostValue)}đ</div>
-                          </div>
-                          <div style={{background:'#ccfbf1',border:'1px solid #99f6e4',borderRadius:5,padding:'5px 7px'}}>
-                            <div style={{fontSize:'.55rem',color:'#0f766e',fontWeight:700}}>🎨 PE</div>
-                            <div className="mono" style={{fontSize:'.72rem',fontWeight:800,color:'#0f766e'}}>{fv(g.coatedKg)} kg</div>
-                            <div className="mono" style={{fontSize:'.65rem',color:'#0f766e',fontWeight:600}}>{fv(g.coatedCostValue)}đ</div>
-                          </div>
-                        </div>
-                        {/* Min/Max — dư & thiếu theo từng SKU, không bù trừ */}
-                        {alert.totalMin>0&&(
-                          <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:5,padding:'6px 9px'}}>
-                            <div style={{display:'flex',justifyContent:'space-between',fontSize:'.6rem',color:'#475569',fontWeight:700,marginBottom:3}}>
-                              <span>Tổng tồn: <strong>{fv(alert.total)} kg</strong></span>
-                              <span>Min: {fv(alert.totalMin)}{alert.totalMax>0?` · Max: ${fv(alert.totalMax)}`:''}</span>
-                            </div>
-                            <div className="stock-bar" style={{height:5,marginBottom:5}}><div className="stock-bar-fill" style={{width:`${Math.min((alert.total/alert.totalMin)*100,100)}%`,background:alert.tongThieu>0?'#dc2626':alert.isNear?'#d97706':alert.tongDu>0&&!alert.tongThieu?'#7c3aed':'#16a34a'}}/></div>
-                            <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
-                              {alert.tongThieu>0&&<div style={{fontSize:'.58rem',fontWeight:800,color:'#b91c1c',background:'#fee2e2',border:'1px solid #fca5a5',borderRadius:3,padding:'1px 6px'}}>
-                                🔴 SKU thiếu min: <span className="mono">{fv(alert.tongThieu)} kg</span>
-                              </div>}
-                              {alert.tongDu>0&&<div style={{fontSize:'.58rem',fontWeight:800,color:'#6d28d9',background:'#f3e8ff',border:'1px solid #d8b4fe',borderRadius:3,padding:'1px 6px'}}>
-                                🟣 SKU dư min: <span className="mono">{fv(alert.tongDu)} kg</span>
-                              </div>}
-                              {!alert.tongThieu&&!alert.tongDu&&<div style={{fontSize:'.58rem',fontWeight:700,color:'#15803d'}}>✓ Tất cả SKU đạt kế hoạch</div>}
-                            </div>
-                          </div>
-                        )}
-                        {/* DOANH THU TỪNG THÁNG */}
-                        <div style={{background:'#f0f9ff',border:'1px solid #bae6fd',borderRadius:6,padding:'7px 10px'}}>
-                          <div style={{fontSize:'.6rem',color:'#0369a1',fontWeight:900,marginBottom:6,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-                            <span>📊 Doanh thu theo tháng</span>
-                            <span style={{fontSize:'.58rem',color:'#64748b',fontWeight:600}}>SL · DT · Đơn giá BQ</span>
-                          </div>
-                          {last3Months.length>0?(
-                            <div style={{display:'flex',flexDirection:'column',gap:4}}>
-                              {last3Months.map((m,mi)=>{
-                                const rv=getRevForAlloyMonth(alloy,m);
-                                const coeffSL=rv.sanLuong>0?(alert.total/rv.sanLuong):null;
-                                const coeffDT=rv.doanhThu>0?(totalVal/rv.doanhThu):null;
-                                return(
-                                <div key={mi} style={{background:mi===0?'#e0f2fe':'#ffffff',border:'1px solid #bae6fd',borderRadius:5,padding:'5px 8px'}}>
-                                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:3}}>
-                                    <span style={{fontWeight:900,fontSize:'.65rem',color:'#0369a1'}}>{m}</span>
-                                    {mi===0&&<span style={{fontSize:'.58rem',color:'#0284c7',fontWeight:700,background:'#bae6fd',borderRadius:3,padding:'1px 5px'}}>Gần nhất</span>}
-                                  </div>
-                                  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:4}}>
-                                    <div>
-                                      <div style={{fontSize:'.55rem',color:'#64748b',fontWeight:600}}>Sản lượng</div>
-                                      <div className="mono" style={{fontSize:'.72rem',fontWeight:800,color:'#15803d'}}>{rv.sanLuong>0?fv(rv.sanLuong)+' kg':'—'}</div>
-                                    </div>
-                                    <div>
-                                      <div style={{fontSize:'.55rem',color:'#64748b',fontWeight:600}}>Doanh thu</div>
-                                      <div className="mono" style={{fontSize:'.72rem',fontWeight:800,color:'#1d4ed8'}}>{rv.doanhThu>0?fv(rv.doanhThu)+'đ':'—'}</div>
-                                    </div>
-                                    <div>
-                                      <div style={{fontSize:'.55rem',color:'#64748b',fontWeight:600}}>Đơn giá BQ</div>
-                                      <div className="mono" style={{fontSize:'.72rem',fontWeight:800,color:'#854d0e'}}>{rv.donGia>0?fv(rv.donGia):'—'}</div>
-                                    </div>
-                                  </div>
-                                  {/* Hệ số tồn so với tháng đó */}
-                                  {(coeffSL!==null||coeffDT!==null)&&(
-                                    <div style={{marginTop:4,display:'flex',gap:8,borderTop:'1px solid #bae6fd',paddingTop:3}}>
-                                      {coeffSL!==null&&<div style={{fontSize:'.58rem',color:'#475569',fontWeight:600}}>
-                                        Hệ số SL: <span className="mono" style={{fontWeight:900,color:coeffSL>3?'#7c3aed':coeffSL>1.5?'#d97706':'#15803d'}}>{coeffSL.toFixed(2)}×</span>
-                                      </div>}
-                                      {coeffDT!==null&&<div style={{fontSize:'.58rem',color:'#475569',fontWeight:600}}>
-                                        Hệ số GT: <span className="mono" style={{fontWeight:900,color:coeffDT>3?'#7c3aed':coeffDT>1.5?'#d97706':'#15803d'}}>{coeffDT.toFixed(2)}×</span>
-                                      </div>}
-                                    </div>
-                                  )}
-                                </div>
-                                );
-                              })}
-                            </div>
-                          ):(
-                            <div style={{textAlign:'center',padding:'8px',color:'#94a3b8',fontSize:'.65rem',fontWeight:600}}>Chưa có dữ liệu — nhấn Sync All</div>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                    );
-                  })}
-                </div>
-
-                {/* ROW 3: Hạn mức */}
-                <div style={{borderTop:`1px solid ${border1}`,paddingTop:12}}>
-                  <div style={{fontSize:'.63rem',color:'#1e293b',fontWeight:900,textTransform:'uppercase',letterSpacing:'.06em',marginBottom:8,display:'flex',alignItems:'center',gap:5}}>
-                    <Ic.Alert/> Hạn mức tổng {limitsWarnings.totalAlerts>0&&<span className="tag tr" style={{fontSize:'.6rem',marginLeft:4}}>{limitsWarnings.totalAlerts} vi phạm</span>}
-                  </div>
-                  <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:8}}>
-                    {[
-                      {bg:limitsWarnings.warnOverKg,label:'📦 Kho tồn (kg)',actual:limitsWarnings.totalKg,limit:limitsWarnings.inventoryMaxKg,unit:' kg',extra:limitsWarnings.inventoryMinKg>0?`MinKg: ${fv(limitsWarnings.inventoryMinKg)} · ${limitsWarnings.warnUnderKg?`▼ Thiếu ${fv(limitsWarnings.inventoryMinKg-limitsWarnings.totalKg)} kg`:'✓ Đạt'}`:null,lbl:`MaxKg: ${fv(limitsWarnings.inventoryMaxKg)}`,f1:'inventoryMaxKg',f2:'inventoryMinKg',v1:limitsWarnings.inventoryMaxKg,v2:limitsWarnings.inventoryMinKg,l1:'Max Kg',l2:'Min Kg'},
-                      {bg:limitsWarnings.warnOverAP,label:'🏦 Công nợ (AP)',actual:limitsWarnings.actualAP,limit:limitsWarnings.apLimit,unit:'đ',extra:null,lbl:`APLimit: ${fv(limitsWarnings.apLimit)}đ`,f1:'accountsPayableLimit',f2:'actualAccountsPayable',v1:limitsWarnings.apLimit,v2:limitsWarnings.actualAP,l1:'AP Limit',l2:'CN thực tế'},
-                      {bg:limitsWarnings.warnOverCredit,label:'💳 Credit Max',actual:limitsWarnings.totalUsed,limit:limitsWarnings.totalCreditMax,unit:'đ',extra:limitsWarnings.totalCreditMin>0?`Min: ${fv(limitsWarnings.totalCreditMin)}đ · ${limitsWarnings.warnUnderCredit?'▼ Dưới min':'✓ OK'}`:null,lbl:`Max: ${fv(limitsWarnings.totalCreditMax)}đ`,f1:'totalCreditMax',f2:'totalCreditMin',v1:limitsWarnings.totalCreditMax,v2:limitsWarnings.totalCreditMin,l1:'Credit Max',l2:'Credit Min'},
-                    ].map((box,bi)=>(
-                      <div key={bi} style={{background:box.bg?'#fef2f2':bg4,border:`1px solid ${box.bg?'#fca5a5':border2}`,borderRadius:6,padding:'9px 10px'}}>
-                        <div style={{fontSize:'.62rem',fontWeight:900,color:box.bg?'#dc2626':'#334155',marginBottom:6}}>{box.bg&&'⚠ '}{box.label}</div>
-                        <LimitBar actual={box.actual} limit={box.limit} label={box.lbl} unit={box.unit}/>
-                        {box.extra&&<div style={{marginTop:6,fontSize:'.62rem',fontWeight:700,color:'#475569'}}>{box.extra}</div>}
-                        <div style={{marginTop:6,display:'grid',gridTemplateColumns:'1fr 1fr',gap:4}}>
-                          <div><label className="lbl" style={{fontSize:'.53rem'}}>{box.l1}</label><input className="inp inp-xs mono" style={{fontSize:'.72rem'}} value={fv(box.v1)} onChange={e=>setLimField(box.f1,e.target.value)}/></div>
-                          <div><label className="lbl" style={{fontSize:'.53rem'}}>{box.l2}</label><input className="inp inp-xs mono" style={{fontSize:'.72rem'}} value={fv(box.v2)} onChange={e=>setLimField(box.f2,e.target.value)}/></div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-
-              {/* CÁC MÁC KHÁC (không phải 3 mác chính) */}
-              {reportData.alloyStats.filter(g=>!TARGET_ALLOYS.includes(g.alloy)).length>0&&(
+              ):(
                 <>
-                  <div style={{fontSize:'.72rem',fontWeight:900,color:'#1e293b',textTransform:'uppercase',letterSpacing:'.08em',marginBottom:11}}>Các mác khác</div>
-                  <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(340px,1fr))',gap:11}}>
-                    {reportData.alloyStats.filter(g=>!TARGET_ALLOYS.includes(g.alloy)).map((g,i)=>(
-                      <div key={i} style={{background:bg2,border:`1px solid ${border2}`,borderRadius:8,padding:'13px',boxShadow:'0 1px 3px rgba(0,0,0,0.1)'}}>
-                        <div style={{fontWeight:900,fontSize:'1rem',color:'#0f172a',marginBottom:10}}>{g.alloy}</div>
-                        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:7,marginBottom:9}}>
-                          {[{l:'KL tồn kho',v:fv(g.totalKg)+' kg',c:'#15803d'},{l:'Vốn TK',v:fv(g.totalCostValue)+'đ',c:'#1d4ed8'},{l:'BQ GV hiện tại',v:fv(g.avgBefore)+' đ/kg',c:'#334155'},{l:'BQ Sau nhập',v:fv(g.avgAfter)+' đ/kg',c:g.avgAfter>g.avgBefore?'#dc2626':'#2563eb'}].map((x,j)=>(
-                            <div key={j} style={{background:bg4,borderRadius:5,padding:'7px 9px',border:`1px solid ${border1}`}}>
-                              <div style={{fontSize:'.6rem',color:'#475569',fontWeight:700,marginBottom:2}}>{x.l}</div>
-                              <div className="mono" style={{fontSize:'.85rem',fontWeight:800,color:x.c}}>{x.v}</div>
-                            </div>
-                          ))}
-                        </div>
-                        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:5}}>
-                          <div style={{background:'#fef08a',border:'1px solid #fde047',borderRadius:5,padding:'6px 8px'}}><div style={{fontSize:'.6rem',color:'#854d0e',fontWeight:800}}>⬜ NOPE</div><div className="mono" style={{fontSize:'.78rem',fontWeight:800,color:'#a16207'}}>{fv(g.plainKg)} kg · {fv(g.plainCostValue)}đ</div></div>
-                          <div style={{background:'#ccfbf1',border:'1px solid #99f6e4',borderRadius:5,padding:'6px 8px'}}><div style={{fontSize:'.6rem',color:'#0f766e',fontWeight:800}}>🎨 PE</div><div className="mono" style={{fontSize:'.78rem',fontWeight:800,color:'#0f766e'}}>{fv(g.coatedKg)} kg · {fv(g.coatedCostValue)}đ</div></div>
-                        </div>
+                  {(()=>{
+                    const mk=marketData[0],mkPrev=marketData[1]||null;
+                    const num=v=>{const f=parseFloat(v);return isNaN(f)?null:f;};
+                    const arrow=(c,p)=>(c==null||p==null)?'':c>p?' ▲':c<p?' ▼':' =';
+                    return (
+                      <div style={{display:'flex',gap:10,flexWrap:'wrap',marginBottom:12}}>
+                        {[
+                          {l:'SMM A00',v:num(mk.smm_cny),u:'¥/t',p:mkPrev&&num(mkPrev.smm_cny)},
+                          {l:'SMM quy đổi',v:num(mk.smm_usd),u:'$/t',p:mkPrev&&num(mkPrev.smm_usd)},
+                          {l:'LME cash',v:num(mk.lme_usd),u:'$/t',p:mkPrev&&num(mkPrev.lme_usd)},
+                          {l:'SHFE',v:num(mk.shfe_cny),u:'¥/t',p:mkPrev&&num(mkPrev.shfe_cny)},
+                          {l:'USD/VND',v:num(mk.usd_vnd),u:'',p:mkPrev&&num(mkPrev.usd_vnd)},
+                          {l:'CNY/VND',v:num(mk.cny_vnd),u:'',p:mkPrev&&num(mkPrev.cny_vnd)},
+                        ].map((b,i)=>(
+                          <div key={i} className="card" style={{padding:'7px 12px',minWidth:118}}>
+                            <div style={{fontSize:'.62rem',fontWeight:800,color:'#64748b'}}>{b.l}</div>
+                            <div className="mono" style={{fontSize:'.9rem',fontWeight:900,color:b.p!=null&&b.v!=null?(b.v>b.p?'#dc2626':b.v<b.p?'#16a34a':'#0f172a'):'#0f172a'}}>{b.v!=null?fv(b.v):'—'}{b.u?` ${b.u}`:''}<span style={{fontSize:'.64rem'}}>{arrow(b.v,b.p)}</span></div>
+                          </div>
+                        ))}
                       </div>
+                    );
+                  })()}
+
+                  <div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:10,alignItems:'center'}}>
+                    <span style={{fontSize:'.68rem',fontWeight:800,color:'#475569'}}>Lọc CIF theo mác:</span>
+                    {['ALL',...new Set(allRawImportPrices.map(u=>u.alloy).filter(Boolean))].map(a=>(
+                      <button key={a} className={`btn btn-sm ${marketAlloy===a?'btn-purple':'btn-ghost'}`} style={{padding:'2px 10px',fontSize:'.68rem'}} onClick={()=>setMarketAlloy(a)}>{a==='ALL'?'Tất cả':a}</button>
                     ))}
+                  </div>
+
+                  <div className="card" style={{padding:'12px 14px',marginBottom:12}}>
+                    <div style={{height:340,position:'relative'}}><canvas ref={marketChartRef}></canvas></div>
+                    <div style={{fontSize:'.64rem',color:'#94a3b8',fontWeight:600,marginTop:6}}>◆ xanh lá = CIF mua thực tế từng đợt (sheet Giá nhập cập nhật) · đường đỏ = SMM A00 quy USD theo tỷ giá từng ngày · khoảng hở dọc giữa ◆ và đường đỏ = premium gia công + cước NCC đang tính.</div>
+                  </div>
+
+                  <div className="card" style={{padding:'12px 14px'}}>
+                    <div style={{fontWeight:900,fontSize:'.82rem',color:'#0f172a',marginBottom:4}}>Premium động theo quy cách <span style={{fontSize:'.64rem',fontWeight:700,color:'#64748b'}}>(premium = CIF đợt nhập − SMM quy đổi cùng thời điểm · KHÔNG cào bằng)</span></div>
+                    <table className="tbl" style={{fontSize:'.72rem'}}>
+                      <thead><tr>
+                        <th style={{textAlign:'left'}}>Quy cách</th><th>Số đợt</th><th>CIF gần nhất<div style={{fontSize:'.54rem',fontWeight:600,opacity:.75}}>$/t · ngày</div></th><th>Premium gần nhất<div style={{fontSize:'.54rem',fontWeight:600,opacity:.75}}>$/t</div></th><th>Premium TB<div style={{fontSize:'.54rem',fontWeight:600,opacity:.75}}>$/t</div></th><th>CIF tham chiếu hôm nay<div style={{fontSize:'.54rem',fontWeight:600,opacity:.75}}>SMM nay + Premium TB</div></th><th>Xu hướng premium</th>
+                      </tr></thead>
+                      <tbody>
+                        {marketPremiumStats.filter(g=>marketAlloy==='ALL'||g.alloy===marketAlloy).map((g,i)=>{
+                          const trendPct=(g.premAvg&&g.premLast!=null&&g.premAvg!==0)?(g.premLast-g.premAvg)/Math.abs(g.premAvg)*100:null;
+                          return (
+                            <tr key={i}>
+                              <td style={{textAlign:'left',fontWeight:800}}>{g.alloy} {g.temper} <span style={{color:'#64748b',fontWeight:700}}>{g.range}</span></td>
+                              <td className="mono">{g.n}</td>
+                              <td className="mono">{fv(g.lastCIF)} <span style={{fontSize:'.6rem',color:'#94a3b8'}}>{g.lastDate}</span></td>
+                              <td className="mono" style={{fontWeight:800}}>{g.premLast!=null?fv(g.premLast):'—'}</td>
+                              <td className="mono">{g.premAvg!=null?fv(g.premAvg):'—'}</td>
+                              <td className="mono" style={{fontWeight:900,color:'#0891b2'}}>{g.refCIF!=null?fv(g.refCIF):'—'}</td>
+                              <td>{trendPct==null?<span style={{color:'#cbd5e1'}}>—</span>:<span style={{fontWeight:900,color:trendPct>5?'#b91c1c':trendPct<-5?'#15803d':'#475569'}}>{trendPct>0?'▲ +':trendPct<0?'▼ ':''}{trendPct.toFixed(1)}%</span>}</td>
+                            </tr>
+                          );
+                        })}
+                        {marketPremiumStats.filter(g=>marketAlloy==='ALL'||g.alloy===marketAlloy).length===0&&(
+                          <tr><td colSpan={7} style={{padding:14,color:'#94a3b8',fontWeight:600}}>Chưa có dữ liệu CIF (sheet Giá nhập cập nhật) khớp bộ lọc — hoặc chưa backfill lịch sử SMM (chạy backfillMarketHistory).</td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                    <div style={{fontSize:'.64rem',color:'#94a3b8',fontWeight:600,marginTop:6}}>ℹ️ PriceFC trong sheet = giá về tới cảng VN (chưa gồm CP về kho {inputs.managementFee||1.5}% — chỉnh ở tab PAKD Mua). Xu hướng ▲ đỏ = premium đợt mới cao hơn trung bình các đợt trước &gt;5% — NCC đang chém.</div>
                   </div>
                 </>
               )}
             </div>
           </div>
-          );
-        })()}
+        )}
 
         {/* ════ TAB SCENARIOS — ĐÃ BỎ (thay bằng nút 💾 Lưu Local / 📁 Nháp Local) ════ */}
         {false&&(
