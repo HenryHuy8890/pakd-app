@@ -561,8 +561,9 @@ const App=()=>{
     const groups={};
     allRawImportPrices.forEach(u=>{
       const cif=parseFloat(u.priceFC)||0;if(cif<=0)return;
-      const d=parseVNDate(u.updateDate);if(!d||isNaN(d.getTime()))return;
-      const iso=d.toISOString().slice(0,10);
+      const ts=parseVNDate(u.updateDate);if(!ts)return; // parseVNDate trả TIMESTAMP (số), KHÔNG phải Date
+      const dd=new Date(ts);
+      const iso=`${dd.getFullYear()}-${String(dd.getMonth()+1).padStart(2,'0')}-${String(dd.getDate()).padStart(2,'0')}`;
       const key=`${u.alloy}|${u.temper}|${u.minThick}-${u.maxThick}`;
       if(!groups[key])groups[key]={alloy:u.alloy,temper:u.temper,range:`${u.minThick}–${u.maxThick}mm`,entries:[]};
       groups[key].entries.push({iso,cif});
@@ -590,8 +591,9 @@ const App=()=>{
       allRawImportPrices.forEach(u=>{
         if(marketAlloy!=='ALL'&&u.alloy!==marketAlloy) return;
         const cif=num(u.priceFC);if(!cif)return;
-        const d=parseVNDate(u.updateDate);if(!d||isNaN(d.getTime()))return;
-        const iso=d.toISOString().slice(0,10);
+        const ts=parseVNDate(u.updateDate);if(!ts)return; // parseVNDate trả TIMESTAMP (số)
+        const dd=new Date(ts);
+        const iso=`${dd.getFullYear()}-${String(dd.getMonth()+1).padStart(2,'0')}-${String(dd.getDate()).padStart(2,'0')}`;
         let lbl=labels.includes(iso)?iso:null;
         if(!lbl){for(let i=labels.length-1;i>=0;i--){if(labels[i]<=iso){lbl=labels[i];break;}}}
         if(!lbl)lbl=labels[0];
