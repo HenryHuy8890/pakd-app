@@ -87,6 +87,7 @@ function doPost(e){
     if (body.action === 'ping') return json_({ ok: true, msg: 'PAKD Apps Script sẵn sàng' });
     if (body.action === 'markBuyReqDone')    return json_(markBuyReqDone_(body.payload || {}, by));
     if (body.action === 'updatePODelivered') return json_(updatePODelivered_(body.payload || {}, by));
+    if (body.action === 'setBuyRequest')     return json_(setBuyRequest_(body.payload || {}, by));
     if (body.action === 'storeMarket'){ // GĐ3a plan B: GitHub Actions kéo giá rồi đẩy vào đây
       const p = body.payload || {};
       const n = x => { const f = parseFloat(x); return isNaN(f) ? null : f; };
@@ -124,6 +125,35 @@ function markBuyReqDone_(p, by){
     if (cWeek >= 0) sh.getRange(i + 1, cWeek + 1).clearContent();
     audit_(by, 'XỬ LÝ ĐỀ XUẤT MUA', skuLabel_(p), 'yêu cầu=' + oldReq + ' tuần=' + oldWeek, '(đã xóa)');
     return { ok: true, msg: 'Đã xóa đề xuất mua của ' + skuLabel_(p) };
+  }
+  return { ok: false, error: 'Không tìm thấy SKU ' + skuLabel_(p) + ' trong sheet Min/Max' };
+}
+
+// R4: GHI/SỬA đề xuất mua từ app (TP Kinh doanh…) → cột yeucaumua + tuanyeucau (lưu vết giá trị cũ)
+function setBuyRequest_(p, by){
+  const sh = sheetByGid_(GID_MINMAX);
+  const data = sh.getDataRange().getValues();
+  const H = data[0];
+  const cA = colIdx_(H, ['mac', 'alloy']), cT = colIdx_(H, ['temper']),
+        cD = colIdx_(H, ['day', 'thickness']), cR = colIdx_(H, ['rong', 'width']),
+        cL = colIdx_(H, ['dai', 'length']), cP = colIdx_(H, ['phu', 'coating']),
+        cReq = colIdx_(H, ['yeucaumua', 'yeu cau mua']),
+        cWeek = colIdx_(H, ['tuanyeucau', 'tuan yeu cau']);
+  if (cReq < 0) return { ok: false, error: 'Sheet Min/Max không có cột yeucaumua' };
+  const qty = parseFloat(p.request);
+  if (isNaN(qty) || qty <= 0) return { ok: false, error: 'Khối lượng đề xuất không hợp lệ' };
+  const want = skuKey_(p);
+  for (var i = 1; i < data.length; i++){
+    const row = data[i];
+    const key = skuKey_({ alloy: row[cA], temper: row[cT], thickness: row[cD],
+                          width: row[cR], length: row[cL], coating: coat_(row[cP]) });
+    if (key !== want) continue;
+    const oldReq = row[cReq], oldWeek = cWeek >= 0 ? row[cWeek] : '';
+    sh.getRange(i + 1, cReq + 1).setValue(qty);
+    if (cWeek >= 0 && p.week) sh.getRange(i + 1, cWeek + 1).setValue(String(p.week));
+    audit_(by, 'ĐỀ XUẤT MUA (' + (String(oldReq).trim() === '' ? 'mới' : 'sửa') + ')', skuLabel_(p),
+           'yêu cầu=' + oldReq + ' tuần=' + oldWeek, 'yêu cầu=' + qty + ' tuần=' + (p.week || oldWeek));
+    return { ok: true, msg: 'Đã ghi đề xuất mua ' + qty + ' kg cho ' + skuLabel_(p) + (p.week ? ' (' + p.week + ')' : '') };
   }
   return { ok: false, error: 'Không tìm thấy SKU ' + skuLabel_(p) + ' trong sheet Min/Max' };
 }

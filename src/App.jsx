@@ -131,14 +131,14 @@ const App=()=>{
         id:'d'+Date.now(),
         label:label.trim()||nameDefault,
         savedAt:new Date().toISOString(),
-        inputs,products,sellingPrices,
+        inputs,products,sellingPrices,cfMode,cfManualWeek,
         snapshot:{totalKg:r?r.totalKg:0,totalVND:r?r.invoiceVND:0,totalGrossProfit:r?r.totalGrossProfit:0},
       });
       localStorage.setItem('pakd_local_drafts',JSON.stringify(drafts.slice(0,100)));
       setLocalDrafts(drafts.slice(0,100));
       alert('✓ Đã lưu nháp trên máy này (localStorage). Mở bằng nút "💾 Nháp Local".');
     }catch(e){ alert('❌ Lỗi lưu nháp: '+e.message); }
-  },[inputs,products,sellingPrices]);
+  },[inputs,products,sellingPrices,cfMode,cfManualWeek]);
 
   // SỬA #4: Lưu nháp Giá sàn vào localStorage (KHÔNG đẩy GitHub). Tải lại y nguyên trạng thái tab Sàn.
   const saveFloorLocal=useCallback(()=>{
@@ -240,6 +240,9 @@ const App=()=>{
       if(payload.products) setProducts(payload.products);
       // SỬA #3 (R6): khôi phục Giá bán KH (sellingPrices) để sếp tải PA thấy đủ giá bán theo SKU
       if(Array.isArray(payload.sellingPrices)&&payload.sellingPrices.length>0) setSP(payload.sellingPrices);
+      // FIX: khôi phục 🚢 Tuần Cont về (PA cũ không có trường này → giữ nguyên hiện tại)
+      if(payload.cfMode) setCFMode(payload.cfMode);
+      if(payload.cfManualWeek!=null) setCFManualWeek(payload.cfManualWeek);
       setLoadedApprovals(Array.isArray(payload.approvals)?payload.approvals:[]);
       setGhStatus(p=>({...p,loading:false,lastAction:`✓ Đã tải ${file.name}`,loadOpen:false}));
       const statusTxt=payload.status==='approved'?`\n✓ Trạng thái: ĐÃ DUYỆT bởi ${payload.approvedBy||'?'} lúc ${payload.approvedAt||'?'}`:payload.status==='rejected'?`\n✗ Trạng thái: TỪ CHỐI`:`\n⏳ Trạng thái: CHỜ DUYỆT`;
@@ -443,6 +446,7 @@ const App=()=>{
         status:prog2.done?'approved':'pending',
         approvals,approvedBy:prog2.done?me.name:null,approvedAt:prog2.done?now.toISOString():null,approveNote:null,
         inputs,products,sellingPrices,
+        cfMode,cfManualWeek, // 🚢 Tuần Cont về — FIX: trước đây không lưu nên tải PA bị mất
         snapshot:{inventoryCount:inventory.length,totalKg:r?r.totalKg:0,totalVND:r?r.invoiceVND:0,totalGrossProfit:r?r.totalGrossProfit:0}
       };
       const contentB64=btoa(unescape(encodeURIComponent(JSON.stringify(payload,null,2))));
@@ -453,7 +457,7 @@ const App=()=>{
       setGhStatus(p=>({...p,loading:false,error:e.message}));
       alert(`❌ Lỗi khi trình duyệt:\n${e.message}`);
     }
-  },[ghAPI,inputs,products,sellingPrices,inventory,ghConfig.branch,approvers,loadApprovers,askPin,sha256]);
+  },[ghAPI,inputs,products,sellingPrices,cfMode,cfManualWeek,inventory,ghConfig.branch,approvers,loadApprovers,askPin,sha256]);
 
   // ── Ghi 1 lượt ý kiến/duyệt vào approvals[] của PA — SỬA #3c (R3): TỰ NHẬN DIỆN người ký BẰNG PIN ──
   // decision: 'approved'|'rejected'; opinion: ý kiến; pin: PIN của người đang ký (hệ thống tự biết là ai + bước mấy).
@@ -674,12 +678,17 @@ const App=()=>{
       if(String(r.status).toUpperCase().includes('TRANSIT')) transitKg+=q; else stockKg+=q;
       const k=skuKey(r);sums[k]=(sums[k]||0)+q;
     });
-    let lowCount=0;
+    const lowList=[];
     minStockRows.forEach(r=>{
       const min=parseFloat(r.minStockKg)||0;
-      if(min>0&&(sums[skuKey(r)]||0)<min) lowCount++;
+      const have=sums[skuKey(r)]||0;
+      if(min>0&&have<min) lowList.push({label:skuLabel(r),have,min});
     });
-    return {stockKg,transitKg,value:calcInventoryValue(inventory),lowCount};
+    lowList.sort((a,b)=>(a.have/a.min)-(b.have/b.min)); // thiếu nặng nhất lên đầu
+    const byAlloyMap={};
+    inventory.forEach(r=>{const q=parseFloat(r.qtyKg)||0;byAlloyMap[r.alloy]=(byAlloyMap[r.alloy]||0)+q;});
+    const byAlloy=Object.entries(byAlloyMap).map(([alloy,kg])=>({alloy,kg})).sort((a,b)=>b.kg-a.kg);
+    return {stockKg,transitKg,value:calcInventoryValue(inventory),lowCount:lowList.length,lowList,byAlloy};
   },[inventory,minStockRows]);
   const ceoCF=useMemo(()=>{
     if(!cashFlowData.length) return null;
@@ -687,6 +696,7 @@ const App=()=>{
     return cashFlowData.find(r=>matchWeekLabel(r.tuan,cur))||null;
   },[cashFlowData]);
   const ceoPending=useMemo(()=>(ghStatus.plansList||[]).filter(f=>f._status==='pending'),[ghStatus.plansList]);
+  const [ceoOpen,setCeoOpen]=useState({}); // drill-down: bấm thẻ nào mở chi tiết thẻ đó
   // Ghi danh sách người duyệt lên GitHub
   const saveApprovers=useCallback(async(list)=>{
     const payload={version:1,updatedAt:new Date().toISOString(),approvers:list};
@@ -1410,6 +1420,19 @@ const App=()=>{
     const res=await gasCall('markBuyReqDone',{alloy:r.alloy,temper:r.temper,thickness:r.thickness,width:r.width,length:r.length,coating:r.coating},me.name);
     if(res){alert(`✓ ${res.msg}\nNgười xử lý: ${me.name} (đã lưu vết).`);syncGoogleSheet('ms');}
   },[identifyByPin,gasCall,syncGoogleSheet]);
+  // ── R4: TP Kinh doanh (hoặc người liên quan) ĐỀ XUẤT MUA ngay trong app → ghi cột yeucaumua + tuanyeucau trên GSheet ──
+  const handleSetBuyRequest=useCallback(async(r)=>{
+    const raw=window.prompt(`➕ ĐỀ XUẤT MUA — ${skuLabel(r)}\nTồn Min: ${fv(r.minStockKg)} kg${r.buyRequest?`\nĐề xuất hiện tại: ${r.buyRequest}${r.buyRequestWeek?' ('+r.buyRequestWeek+')':''}`:''}\n\nNhập KHỐI LƯỢNG đề xuất mua (kg):`,String(r.buyRequest||''));
+    if(raw===null) return;
+    const qty=pn(raw);
+    if(!qty||qty<=0){alert('❌ Khối lượng không hợp lệ');return;}
+    const week=window.prompt('Tuần cần hàng (Enter = tuần hiện tại):',r.buyRequestWeek||getCurrentWeekLabel());
+    if(week===null) return;
+    const me=await identifyByPin('🔐 Nhập PIN để ghi ĐỀ XUẤT MUA lên GSheet (định danh + lưu vết):');
+    if(!me) return;
+    const res=await gasCall('setBuyRequest',{alloy:r.alloy,temper:r.temper,thickness:r.thickness,width:r.width,length:r.length,coating:r.coating,request:qty,week:(week||'').trim()},me.name);
+    if(res){alert(`✓ ${res.msg}\nNgười đề xuất: ${me.name} (đã lưu vết AUDIT_LOG).`);syncGoogleSheet('ms');}
+  },[identifyByPin,gasCall,syncGoogleSheet]);
   // ── GĐ2: cập nhật TL đã giao của 1 dòng PO ngay trong app ──
   const handleUpdatePODelivered=useCallback(async(p)=>{
     const raw=window.prompt(`PO ${p.po} — ${skuLabel(p)}\nTL đặt: ${fv(p.ordered)} kg · Đã giao: ${fv(p.delivered)} kg\n\nNhập TL ĐÃ GIAO mới (kg):`,String(p.delivered||0));
@@ -1951,7 +1974,7 @@ URL.revokeObjectURL(url);
 
             {/* DÒNG TIỀN TUẦN */}
             <div style={{background:'#fff',borderRadius:12,padding:'13px 15px',marginBottom:10}}>
-              <div style={{fontSize:'.66rem',fontWeight:900,color:'#64748b',marginBottom:5}}>💰 DÒNG TIỀN {ceoCF?ceoCF.tuan.toUpperCase():'TUẦN NÀY'}</div>
+              <div onClick={()=>setCeoOpen(p=>({...p,cf:!p.cf}))} style={{fontSize:'.66rem',fontWeight:900,color:'#64748b',marginBottom:5,cursor:'pointer',display:'flex',justifyContent:'space-between'}}><span>💰 DÒNG TIỀN {ceoCF?ceoCF.tuan.toUpperCase():'TUẦN NÀY'}</span><span style={{color:'#2563eb'}}>{ceoOpen.cf?'▲ thu gọn':'▼ chi tiết'}</span></div>
               {!ceoCF?(
                 <div style={{color:'#b45309',fontWeight:700,fontSize:'.74rem'}}>⚠ Chưa có dữ liệu tuần này — bấm Làm mới</div>
               ):(
@@ -1964,30 +1987,88 @@ URL.revokeObjectURL(url);
                     <span>Chi: <b style={{color:'#b45309'}}>{(ceoCF.tongChi/1e9).toFixed(2)} tỷ</b></span>
                     <span>Ròng: <b style={{color:ceoCF.rong<0?'#dc2626':'#15803d'}}>{(ceoCF.rong/1e9).toFixed(2)} tỷ</b></span>
                   </div>
+                  {ceoOpen.cf&&(()=>{
+                    const cur=getCurrentWeekLabel();
+                    const idx=cashFlowData.findIndex(r=>matchWeekLabel(r.tuan,cur));
+                    const next=idx>=0?cashFlowData.slice(idx,idx+5):cashFlowData.slice(0,5);
+                    return (
+                      <div style={{marginTop:8,borderTop:'1px dashed #e2e8f0',paddingTop:7}}>
+                        <div style={{fontSize:'.6rem',fontWeight:900,color:'#64748b',marginBottom:3}}>CƠ CẤU TUẦN NÀY (tỷ)</div>
+                        <div style={{display:'flex',gap:10,flexWrap:'wrap',fontSize:'.66rem',fontWeight:700,color:'#475569'}}>
+                          <span>Chi HĐ <b className="mono">{(ceoCF.chiHD/1e9).toFixed(2)}</b></span>
+                          <span>Chi ĐĐ <b className="mono">{(ceoCF.chiDD/1e9).toFixed(2)}</b></span>
+                          <span>Chi khác <b className="mono">{(ceoCF.chiKhac/1e9).toFixed(2)}</b></span>
+                          <span>Mua nội <b className="mono">{(ceoCF.muaNoi/1e9).toFixed(2)}</b></span>
+                          <span>Thu CN <b className="mono" style={{color:'#15803d'}}>{(ceoCF.thuCN/1e9).toFixed(2)}</b></span>
+                          <span>Thu DT <b className="mono" style={{color:'#15803d'}}>{(ceoCF.thuDT/1e9).toFixed(2)}</b></span>
+                        </div>
+                        <div style={{fontSize:'.6rem',fontWeight:900,color:'#64748b',margin:'7px 0 3px'}}>5 TUẦN TỚI (tỷ)</div>
+                        <table style={{width:'100%',fontSize:'.66rem',fontWeight:700,borderCollapse:'collapse'}}>
+                          <thead><tr style={{color:'#94a3b8',textAlign:'right'}}><td style={{textAlign:'left'}}>Tuần</td><td>Thu</td><td>Chi</td><td>⚖ Hạn mức</td></tr></thead>
+                          <tbody>{next.map((w,i)=>(
+                            <tr key={i} style={{borderTop:'1px solid #f1f5f9',textAlign:'right'}}>
+                              <td style={{textAlign:'left',padding:'3px 0'}}>{w.tuan}</td>
+                              <td className="mono" style={{color:'#15803d'}}>{(w.tongThu/1e9).toFixed(2)}</td>
+                              <td className="mono" style={{color:'#b45309'}}>{(w.tongChi/1e9).toFixed(2)}</td>
+                              <td className="mono" style={{fontWeight:900,color:w.hanMuc<0?'#dc2626':'#15803d'}}>{w.hanMuc<0?'🔴 ':''}{(w.hanMuc/1e9).toFixed(2)}</td>
+                            </tr>))}</tbody>
+                        </table>
+                      </div>
+                    );
+                  })()}
                 </>
               )}
             </div>
 
             {/* TỒN KHO */}
             <div style={{background:'#fff',borderRadius:12,padding:'13px 15px',marginBottom:10}}>
-              <div style={{fontSize:'.66rem',fontWeight:900,color:'#64748b',marginBottom:5}}>📦 TỒN KHO</div>
+              <div onClick={()=>setCeoOpen(p=>({...p,inv:!p.inv}))} style={{fontSize:'.66rem',fontWeight:900,color:'#64748b',marginBottom:5,cursor:'pointer',display:'flex',justifyContent:'space-between'}}><span>📦 TỒN KHO</span><span style={{color:'#2563eb'}}>{ceoOpen.inv?'▲ thu gọn':'▼ chi tiết'}</span></div>
               <div style={{display:'flex',gap:10,flexWrap:'wrap'}}>
                 <div style={{flex:'1 1 90px'}}><div style={{fontSize:'.6rem',fontWeight:800,color:'#94a3b8'}}>Trong kho</div><div className="mono" style={{fontWeight:900,fontSize:'.95rem'}}>{fv(ceoInv.stockKg)} kg</div></div>
                 <div style={{flex:'1 1 90px'}}><div style={{fontSize:'.6rem',fontWeight:800,color:'#94a3b8'}}>Đang về</div><div className="mono" style={{fontWeight:900,fontSize:'.95rem',color:'#d97706'}}>{fv(ceoInv.transitKg)} kg</div></div>
                 <div style={{flex:'1 1 120px'}}><div style={{fontSize:'.6rem',fontWeight:800,color:'#94a3b8'}}>Giá trị tồn</div><div className="mono" style={{fontWeight:900,fontSize:'.95rem',color:'#2563eb'}}>{(ceoInv.value/1e9).toFixed(2)} tỷ</div></div>
                 <div style={{flex:'1 1 90px'}}><div style={{fontSize:'.6rem',fontWeight:800,color:'#94a3b8'}}>SKU dưới Min</div><div className="mono" style={{fontWeight:900,fontSize:'.95rem',color:ceoInv.lowCount>0?'#dc2626':'#15803d'}}>{ceoInv.lowCount>0?`⚠ ${ceoInv.lowCount}`:'✓ 0'}</div></div>
               </div>
+              {ceoOpen.inv&&(
+                <div style={{marginTop:8,borderTop:'1px dashed #e2e8f0',paddingTop:7}}>
+                  <div style={{fontSize:'.6rem',fontWeight:900,color:'#64748b',marginBottom:3}}>THEO MÁC (tổng kg kho + đang về)</div>
+                  <div style={{display:'flex',gap:6,flexWrap:'wrap',fontSize:'.66rem',fontWeight:800}}>
+                    {ceoInv.byAlloy.map(a=>(<span key={a.alloy} className="mono" style={{background:'#f1f5f9',borderRadius:5,padding:'2px 8px'}}>{a.alloy}: {fv(a.kg)}</span>))}
+                  </div>
+                  {ceoInv.lowList.length>0&&(
+                    <>
+                      <div style={{fontSize:'.6rem',fontWeight:900,color:'#b91c1c',margin:'7px 0 3px'}}>SKU DƯỚI MIN ({ceoInv.lowList.length}) — thiếu nặng trước</div>
+                      {ceoInv.lowList.slice(0,10).map((x,i)=>(
+                        <div key={i} style={{fontSize:'.64rem',fontWeight:700,color:'#475569',padding:'2px 0'}}>{x.label} — tồn <b className="mono" style={{color:'#dc2626'}}>{fv(x.have)}</b>/<b className="mono">{fv(x.min)}</b> kg</div>
+                      ))}
+                      {ceoInv.lowList.length>10&&<div style={{fontSize:'.6rem',color:'#94a3b8',fontWeight:700}}>… và {ceoInv.lowList.length-10} mã nữa (xem tab Min/Max bản đầy đủ)</div>}
+                    </>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* GIÁ HÔM NAY */}
             {marketData[0]&&(
               <div style={{background:'#fff',borderRadius:12,padding:'13px 15px',marginBottom:10}}>
-                <div style={{fontSize:'.66rem',fontWeight:900,color:'#64748b',marginBottom:5}}>📈 GIÁ NHÔM {marketData[0].date}</div>
+                <div onClick={()=>setCeoOpen(p=>({...p,price:!p.price}))} style={{fontSize:'.66rem',fontWeight:900,color:'#64748b',marginBottom:5,cursor:'pointer',display:'flex',justifyContent:'space-between'}}><span>📈 GIÁ NHÔM {marketData[0].date}</span><span style={{color:'#2563eb'}}>{ceoOpen.price?'▲ thu gọn':'▼ 7 ngày'}</span></div>
                 <div style={{display:'flex',gap:14,flexWrap:'wrap',fontSize:'.78rem',fontWeight:800}}>
                   <span>SMM A00: <b className="mono">{fv(marketData[0].smm_cny)} ¥/t</b>{(()=>{const m=parseFloat(marketData[0].smm_move);return m?<b style={{color:m>0?'#dc2626':'#16a34a',fontSize:'.68rem'}}> {m>0?'▲+':'▼'}{fv(m)}</b>:null;})()}</span>
                   <span>LME: <b className="mono">{fv(marketData[0].lme_usd)} $/t</b></span>
                   <span>USD: <b className="mono">{fv(marketData[0].usd_vnd)}</b></span>
                 </div>
+                {ceoOpen.price&&(
+                  <table style={{width:'100%',marginTop:7,borderTop:'1px dashed #e2e8f0',paddingTop:6,fontSize:'.66rem',fontWeight:700,borderCollapse:'collapse'}}>
+                    <thead><tr style={{color:'#94a3b8',textAlign:'right'}}><td style={{textAlign:'left'}}>Ngày</td><td>SMM ¥/t</td><td>±</td><td>LME $/t</td></tr></thead>
+                    <tbody>{marketData.slice(0,7).map((r,i)=>{const m=parseFloat(r.smm_move)||0;return (
+                      <tr key={i} style={{borderTop:'1px solid #f1f5f9',textAlign:'right'}}>
+                        <td style={{textAlign:'left',padding:'2px 0'}}>{String(r.date).slice(5)}</td>
+                        <td className="mono">{fv(r.smm_cny)}</td>
+                        <td className="mono" style={{color:m>0?'#dc2626':m<0?'#16a34a':'#94a3b8'}}>{m>0?'+':''}{m?fv(m):'—'}</td>
+                        <td className="mono">{fv(r.lme_usd)}</td>
+                      </tr>);})}</tbody>
+                  </table>
+                )}
               </div>
             )}
 
@@ -1999,7 +2080,7 @@ URL.revokeObjectURL(url);
               {ceoPending.map((f,i)=>(
                 <div key={f.name} style={{borderTop:i>0?'1px solid #e2e8f0':'none',padding:'9px 0'}}>
                   <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
-                    <div style={{minWidth:0}}>
+                    <div style={{minWidth:0,cursor:'pointer'}} onClick={()=>setCeoOpen(p=>({...p,['pa:'+f.name]:!p['pa:'+f.name]}))}>
                       <div style={{fontWeight:900,fontSize:'.78rem',color:'#0f172a',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{f.name.replace('.json','')}</div>
                       <div style={{fontSize:'.64rem',fontWeight:700,color:'#64748b'}}>Trình: {f._requestedBy} · {fv(f._totalKg)} kg · <b style={{color:'#b45309'}}>{(f._totalVND/1e9).toFixed(2)} tỷ</b></div>
                       {f._requestNote&&<div style={{fontSize:'.62rem',color:'#475569',fontStyle:'italic',marginTop:1}}>📝 {f._requestNote}</div>}
@@ -2013,8 +2094,19 @@ URL.revokeObjectURL(url);
                     })()}
                   </div>
                   <div style={{fontSize:'.6rem',color:'#94a3b8',fontWeight:700,marginTop:3}}>
-                    {(f._approvals||[]).map(a=>`✓ ${a.name} (b${a.step})`).join(' → ')||'Chưa ai ký'}
+                    {(f._approvals||[]).map(a=>`✓ ${a.name} (b${a.step})`).join(' → ')||'Chưa ai ký'}{ceoOpen['pa:'+f.name]?' ▲':' · bấm tên PA xem chi tiết ▼'}
                   </div>
+                  {ceoOpen['pa:'+f.name]&&(
+                    <div style={{marginTop:5,background:'#f8fafc',borderRadius:7,padding:'7px 9px'}}>
+                      <div style={{fontSize:'.62rem',fontWeight:700,color:'#475569'}}>Lưu lúc: {f._savedAt?new Date(f._savedAt).toLocaleString('vi-VN'):'?'} · {fv(f._totalKg)} kg · {(f._totalVND/1e9).toFixed(3)} tỷ</div>
+                      {(f._approvals||[]).length>0?(f._approvals||[]).map((a,j)=>(
+                        <div key={j} style={{fontSize:'.62rem',fontWeight:700,color:'#334155',borderTop:j>0?'1px solid #e2e8f0':'none',marginTop:3,paddingTop:3}}>
+                          {a.decision==='rejected'?'✗':'✓'} <b>{a.name}</b> ({a.role} · bước {a.step}) — {a.at?new Date(a.at).toLocaleString('vi-VN'):''}
+                          {a.opinion&&<div style={{fontStyle:'italic',color:'#64748b'}}>“{a.opinion}”</div>}
+                        </div>
+                      )):<div style={{fontSize:'.62rem',color:'#94a3b8',fontWeight:700,marginTop:3}}>Chưa có chữ ký nào.</div>}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -2818,7 +2910,7 @@ URL.revokeObjectURL(url);
                         </td>
                         <td style={{textAlign:'center',width:90}}>{ratio!==null?(<div><div className="stock-bar" style={{height:5,margin:'0 8px 2px'}}><div className="stock-bar-fill" style={{width:`${Math.min((ratio/2.5)*100,100)}%`,background:isOver?'#6d28d9':ratio<0.8?'#dc2626':ratio<1?'#d97706':ratio>2?'#4f46e5':'#16a34a'}}/></div><span className="mono" style={{fontSize:'.72rem',fontWeight:800,color:isOver?'#6d28d9':ratio<0.8?'#dc2626':ratio<1?'#d97706':ratio>2?'#4f46e5':'#16a34a'}}>{Math.round(ratio*100)}%</span></div>):<span style={{color:'#64748b'}}>—</span>}</td>
                         <td style={{textAlign:'right',paddingRight:9,width:155}}>{isOver?(<span className="mono" style={{fontSize:'.78rem',fontWeight:800,color:'#6d28d9'}}>▲ quá max +{fv(curQty-mx)} kg</span>):delta!=null?(<span className="mono" style={{fontSize:'.78rem',fontWeight:800,color:delta>=0?'#15803d':'#b91c1c'}}>{delta>=0?'▲ dư +':'▼ thiếu '}{fv(Math.abs(delta))} kg</span>):<span style={{color:'#64748b'}}>—</span>}</td>
-                        <td style={{textAlign:'center',background:hasReq?'#fef3c7':'transparent'}}>{hasReq?<span style={{fontSize:'.82rem',fontWeight:900,color:'#92400e'}}>🛒 {r.buyRequest}{gasConfig.url&&<button onClick={()=>handleMarkBuyReqDone(r)} title="✓ ĐÃ XỬ LÝ — xóa đề xuất trên GSheet (cần PIN, có lưu vết AUDIT_LOG)" style={{marginLeft:6,border:'1px solid #16a34a',background:'#f0fdf4',color:'#15803d',borderRadius:4,cursor:'pointer',fontSize:'.66rem',fontWeight:800,padding:'1px 6px'}}>✓ Xử lý</button>}</span>:<span style={{color:'#cbd5e1',fontSize:'.7rem'}}>—</span>}</td>
+                        <td style={{textAlign:'center',background:hasReq?'#fef3c7':'transparent'}}>{hasReq?<span style={{fontSize:'.82rem',fontWeight:900,color:'#92400e'}}>🛒 {r.buyRequest}{gasConfig.url&&<button onClick={()=>handleMarkBuyReqDone(r)} title="✓ ĐÃ XỬ LÝ — xóa đề xuất trên GSheet (cần PIN, có lưu vết AUDIT_LOG)" style={{marginLeft:6,border:'1px solid #16a34a',background:'#f0fdf4',color:'#15803d',borderRadius:4,cursor:'pointer',fontSize:'.66rem',fontWeight:800,padding:'1px 6px'}}>✓ Xử lý</button>}{gasConfig.url&&<button onClick={()=>handleSetBuyRequest(r)} title="Sửa đề xuất (ghi đè GSheet — cần PIN, lưu vết)" style={{marginLeft:4,border:'1px solid #d97706',background:'#fffbeb',color:'#b45309',borderRadius:4,cursor:'pointer',fontSize:'.66rem',fontWeight:800,padding:'1px 5px'}}>✎</button>}</span>:gasConfig.url?<button onClick={()=>handleSetBuyRequest(r)} title="Đề xuất mua mã này — ghi thẳng vào GSheet Min/Max (cần PIN, lưu vết)" style={{border:'1px dashed #94a3b8',background:'transparent',color:'#64748b',borderRadius:4,cursor:'pointer',fontSize:'.64rem',fontWeight:700,padding:'1px 7px'}}>➕ Đề xuất</button>:<span style={{color:'#cbd5e1',fontSize:'.7rem'}}>—</span>}</td>
                         <td style={{textAlign:'center',background:hasReq?'#fef3c7':'transparent'}}>{r.buyRequestWeek?<span style={{fontSize:'.78rem',fontWeight:800,color:'#b45309'}}>{r.buyRequestWeek}</span>:<span style={{color:'#cbd5e1',fontSize:'.7rem'}}>—</span>}</td>
                         <td><button className="btn-danger" onClick={()=>delMS(r.id)}><Ic.X/></button></td>
                       </tr>
@@ -4286,7 +4378,7 @@ URL.revokeObjectURL(url);
                       <div style={{fontWeight:800,fontSize:'.82rem',color:'#0f172a'}}>{d.label}</div>
                       <div style={{fontSize:'.66rem',color:'#475569',fontWeight:600,marginTop:2}}>{d.savedAt?new Date(d.savedAt).toLocaleString('vi-VN'):''} · {d.snapshot?fv(d.snapshot.totalKg)+'kg · '+fv((d.snapshot.totalVND||0)/1e6)+'tr':''}</div>
                     </div>
-                    <button className="btn btn-purple btn-xs" onClick={()=>{if(d.inputs)setInputs(d.inputs);if(d.products)setProducts(d.products);if(Array.isArray(d.sellingPrices)&&d.sellingPrices.length>0)setSP(d.sellingPrices);setDraftModalOpen(false);setTab('main');alert('✓ Đã tải nháp "'+d.label+'" vào màn hình.');}} style={{fontSize:'.65rem'}}>⬇ Tải</button>
+                    <button className="btn btn-purple btn-xs" onClick={()=>{if(d.inputs)setInputs(d.inputs);if(d.products)setProducts(d.products);if(Array.isArray(d.sellingPrices)&&d.sellingPrices.length>0)setSP(d.sellingPrices);if(d.cfMode)setCFMode(d.cfMode);if(d.cfManualWeek!=null)setCFManualWeek(d.cfManualWeek);setDraftModalOpen(false);setTab('main');alert('✓ Đã tải nháp "'+d.label+'" vào màn hình.');}} style={{fontSize:'.65rem'}}>⬇ Tải</button>
                     <button className="btn-danger" onClick={()=>{const next=localDrafts.filter(x=>x.id!==d.id);setLocalDrafts(next);try{localStorage.setItem('pakd_local_drafts',JSON.stringify(next));}catch(e){}}} title="Xóa nháp này"><Ic.X/></button>
                   </div>
                 ))}
