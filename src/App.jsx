@@ -550,7 +550,9 @@ const App=()=>{
   // R3: premium động per quy cách + lọc thời gian + SMM trừ VAT + thống kê & dự phóng
   const [marketAlloy,setMarketAlloy]=useState('ALL');
   const [marketRange,setMarketRange]=useState({preset:'90',from:'',to:''}); // preset: 30|90|180|ALL|custom
-  const [smmExVat,setSmmExVat]=useState(true); // SMM A00 gồm 13% VAT nội địa TQ — trừ ra để so chuẩn với LME/CIF xuất khẩu
+  // TQ HỦY hoàn thuế XK nhôm từ 01/12/2024 (anh Huy xác nhận) → NCC chào theo SMM GỒM VAT.
+  // Mặc định TẮT trừ VAT; chỉ bật khi soi lịch sử các đợt mua TRƯỚC 12/2024.
+  const [smmExVat,setSmmExVat]=useState(false);
   const marketChartRef=useRef(null);const marketChartInst=useRef(null);
   const smmFactor=smmExVat?1/1.13:1;
   // Dòng giá tăng dần theo ngày, lọc theo khoảng thời gian đang chọn
@@ -619,7 +621,7 @@ const App=()=>{
       const num=v=>{const f=parseFloat(v);return isNaN(f)?null:f;};
       const labels=marketRows.map(r=>String(r.date).slice(0,10));
       const smmArr=marketRows.map(r=>{const f=num(r.smm_usd);return f!=null?Math.round(f*smmFactor*10)/10:null;});
-      const shfeUsd=marketRows.map(r=>{const s=num(r.shfe_cny),u=num(r.usd_vnd),c=num(r.cny_vnd);return (s&&u&&c)?Math.round(s*c/u*smmFactor*10)/10:null;});
+      const shfeUsd=marketRows.map(r=>{const s=num(r.shfe_cny),u=num(r.usd_vnd),c=num(r.cny_vnd),su=num(r.smm_usd),sc=num(r.smm_cny);const k=(u&&c)?c/u:((su&&sc)?su/sc:null);return (s&&k)?Math.round(s*k*smmFactor*10)/10:null;});
       const sma30=smmArr.map((_,i)=>{const w=smmArr.slice(Math.max(0,i-29),i+1).filter(v=>v!=null);return w.length>=5?Math.round(w.reduce((a,b)=>a+b,0)/w.length*10)/10:null;});
       const cifPoints=[];
       allRawImportPrices.forEach(u=>{
@@ -3273,8 +3275,8 @@ URL.revokeObjectURL(url);
                       <span style={{fontSize:'.64rem',fontWeight:700,color:'#64748b'}}>đến</span>
                       <input type="date" className="inp inp-xs" style={{width:124}} value={marketRange.to} onChange={e=>setMarketRange(p=>({...p,preset:'custom',to:e.target.value}))}/>
                     </div>
-                    <label style={{display:'flex',gap:5,alignItems:'center',fontSize:'.66rem',fontWeight:800,color:'#475569',cursor:'pointer'}} title="SMM A00 là giá nội địa TQ ĐÃ GỒM 13% VAT. NCC xuất khẩu được hoàn VAT nên giá xuất neo theo SMM trừ VAT — bật để so chuẩn với LME và CIF.">
-                      <input type="checkbox" checked={smmExVat} onChange={e=>setSmmExVat(e.target.checked)}/> SMM trừ VAT 13%
+                    <label style={{display:'flex',gap:5,alignItems:'center',fontSize:'.66rem',fontWeight:800,color:'#475569',cursor:'pointer'}} title="TQ đã HỦY hoàn thuế XK nhôm từ 01/12/2024 → NCC chào theo SMM GỒM VAT (mặc định tắt). Chỉ bật khi soi lịch sử các đợt mua trước 12/2024.">
+                      <input type="checkbox" checked={smmExVat} onChange={e=>setSmmExVat(e.target.checked)}/> SMM trừ VAT 13% <span style={{fontWeight:600,color:'#94a3b8'}}>(chỉ cho lịch sử trước 12/2024)</span>
                     </label>
                     <div style={{display:'flex',gap:4,alignItems:'center'}}>
                       <span style={{fontSize:'.66rem',fontWeight:800,color:'#475569'}}>Mác:</span>

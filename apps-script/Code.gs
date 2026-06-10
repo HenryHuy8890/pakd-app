@@ -414,7 +414,7 @@ function writeMarketRow_(v){
 
 // ═══ R3: BACKFILL lịch sử giá (chạy tay 1 lần; chạy lại = xóa & dựng lại các dòng backfill) ═══
 // SỬA so với R2 (anh Huy phát hiện SMM quá khứ cao bất thường):
-//  1. Quy đổi SMM→USD bằng TỶ GIÁ LỊCH SỬ TỪNG NGÀY (GOOGLEFINANCE historical) — không dùng tỷ giá hôm nay
+//  1. Quy đổi SMM→USD bằng TỶ GIÁ LỊCH SỬ TỪNG NGÀY (USD/CNY từ API Frankfurter/ECB) — không dùng tỷ giá hôm nay
 //     (tỷ lệ SMM¥/LME$ đổi từ 7.8 → 6.6 trong 9 tháng, dùng tỷ giá nay làm SMM cũ bị thổi phồng 10-18%).
 //  2. LME ưu tiên bảng cash settlement CHÍNH THỐNG Westmetall (worthwill thấp hơn ~1-3%), thiếu mới dùng worthwill.
 function backfillMarketHistory(){
@@ -438,28 +438,28 @@ function backfillMarketHistory(){
       if (MON[m[2]]) wmLME[m[3] + '-' + ('0' + MON[m[2]]).slice(-2) + '-' + m[1]] = parseFloat(m[4].replace(/,/g, ''));
     }
   } catch (e){ Logger.log('⚠ Westmetall lỗi (' + e.message + ') — dùng LME worthwill'); }
-  // 3) Tỷ giá LỊCH SỬ qua GOOGLEFINANCE (sheet FX_HELPER, cột D-E và G-H)
+  // 3) Tỷ giá LỊCH SỬ — v2.2: BỎ GOOGLEFINANCE (lỗi #ERROR! do locale tiếng Việt của sheet
+  // dùng dấu ; trong công thức). Dùng API Frankfurter (tỷ giá ECB, miễn phí, JSON, thân thiện IP Google):
+  // USD→CNY lịch sử là đủ để quy SMM→USD. Cột usd_vnd/cny_vnd của dòng backfill để trống
+  // (app tự suy tỷ lệ từ smm_usd/smm_cny cùng dòng khi cần quy đổi SHFE).
   const ss = ss_();
-  let fxh = ss.getSheetByName('FX_HELPER');
-  if (!fxh){ fxh = ss.insertSheet('FX_HELPER'); try { fxh.hideSheet(); } catch (e){} }
-  fxh.getRange('D1').setFormula('=GOOGLEFINANCE("CURRENCY:USDVND","price",DATE(2025,8,1),TODAY()+1,"DAILY")');
-  fxh.getRange('G1').setFormula('=GOOGLEFINANCE("CURRENCY:CNYVND","price",DATE(2025,8,1),TODAY()+1,"DAILY")');
-  SpreadsheetApp.flush();
-  let usdHist = [], cnyHist = [];
-  for (var w = 0; w < 15; w++){
-    Utilities.sleep(1500);
-    usdHist = fxh.getRange('D2:E500').getValues().filter(r => r[0] && r[1]);
-    cnyHist = fxh.getRange('G2:H500').getValues().filter(r => r[0] && r[1]);
-    if (usdHist.length > 10 && cnyHist.length > 10) break;
+  const fxh0 = ss.getSheetByName('FX_HELPER');
+  if (fxh0){ try { fxh0.getRange('D1:K600').clearContent(); } catch (e){} } // dọn công thức #ERROR! cũ
+  let ucMap = {};
+  try {
+    const fr = fetchJson_('https://api.frankfurter.dev/v1/2025-08-01..?base=USD&symbols=CNY');
+    if (fr && fr.rates) Object.keys(fr.rates).forEach(d => { const v = parseFloat(fr.rates[d].CNY); if (v > 0) ucMap[d] = v; });
+  } catch (e){}
+  const dUC = Object.keys(ucMap).sort();
+  const haveUC = dUC.length > 10;
+  Logger.log('FX lịch sử USD→CNY (Frankfurter/ECB): ' + dUC.length + ' ngày' + (haveUC ? ' (' + dUC[0] + ' → ' + dUC[dUC.length - 1] + ')' : ''));
+  const fxAt = (d, map, ds) => { let best = null; for (var i = 0; i < ds.length; i++){ if (ds[i] <= d) best = map[ds[i]]; else break; } return best; };
+  let fxNow = null;
+  if (!haveUC){
+    fxNow = fetchFxRates_();
+    if (!fxNow.usd){ Logger.log('✗ Không lấy được tỷ giá nào — dừng. Thử chạy lại sau vài phút.'); return; }
+    Logger.log('⚠ Frankfurter không trả dữ liệu — dùng tỷ giá HÔM NAY cho quá khứ (XẤP XỈ, SMM cũ có thể lệch vài %).');
   }
-  const mkFx = arr => { const m = {}; arr.forEach(r => { m[iso(r[0])] = parseFloat(r[1]); }); return m; };
-  const usdMap = mkFx(usdHist), cnyMap = mkFx(cnyHist);
-  const fxDates = Object.keys(usdMap).sort();
-  const fxAt = (d, map) => { // tỷ giá ngày gần nhất ≤ d (cuối tuần dùng thứ 6 trước đó)
-    let best = null; for (var i = 0; i < fxDates.length; i++){ if (fxDates[i] <= d && map[fxDates[i]]) best = map[fxDates[i]]; if (fxDates[i] > d) break; }
-    return best;
-  };
-  if (fxDates.length < 10){ Logger.log('✗ GOOGLEFINANCE chưa trả tỷ giá lịch sử — thử chạy lại sau 1 phút'); return; }
   // 4) Dựng lại sheet: GIỮ dòng daily (fetched_at là giờ), XÓA dòng backfill cũ, thêm bản mới
   let sh = ss.getSheetByName(MARKET_SHEET);
   if (!sh){
@@ -471,22 +471,29 @@ function backfillMarketHistory(){
   const header = all[0];
   const kept = []; const keptDates = {};
   for (var r = 1; r < all.length; r++){
-    if (String(all[r][8]) === 'backfill') continue; // bỏ backfill cũ (tỷ giá sai)
+    if (String(all[r][8]).indexOf('backfill') === 0) continue; // bỏ mọi dòng backfill cũ
     kept.push(all[r]); keptDates[iso(all[r][0])] = true;
   }
   const newRows = [];
   Object.keys(byDate).sort().slice(-220).forEach(d => {
     if (keptDates[d]) return;
     const v = byDate[d];
-    const usd = fxAt(d, usdMap), cny = fxAt(d, cnyMap);
     const lme = (wmLME[d] != null) ? wmLME[d] : v.lmeWW;
-    const smmUsd = (v.smm != null && usd && cny) ? Math.round(v.smm * cny / usd * 10) / 10 : null;
-    newRows.push([d, lme || null, v.shfe || null, v.smm || null, v.smmMove || null, smmUsd, usd || null, cny || null, 'backfill']);
+    let usd = null, cny = null, smmUsd = null, tag = 'backfill-usdcny';
+    if (haveUC){
+      const uc = fxAt(d, ucMap, dUC);
+      if (v.smm != null && uc) smmUsd = Math.round(v.smm / uc * 10) / 10; // USD/CNY lịch sử từng ngày (ECB)
+    } else if (fxNow && fxNow.usd && fxNow.cny){
+      usd = fxNow.usd; cny = fxNow.cny;
+      if (v.smm != null) smmUsd = Math.round(v.smm * cny / usd * 10) / 10;
+      tag = 'backfill-fxnay'; // tỷ giá hôm nay — xấp xỉ
+    }
+    newRows.push([d, lme || null, v.shfe || null, v.smm || null, v.smmMove || null, smmUsd, usd, cny, tag]);
   });
   const merged = kept.concat(newRows).sort((a, b) => (iso(a[0]) < iso(b[0]) ? -1 : 1));
   if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, header.length).clearContent();
   if (merged.length) sh.getRange(2, 1, merged.length, header.length).setValues(merged);
-  Logger.log('✓ Backfill v2: ' + newRows.length + ' dòng mới (tỷ giá lịch sử ' + fxDates.length + ' ngày, LME Westmetall ' + Object.keys(wmLME).length + ' ngày), giữ ' + kept.length + ' dòng daily.');
+  Logger.log('✓ Backfill v2.2 (' + (haveUC ? 'tỷ giá USD/CNY lịch sử ECB ' + dUC.length + ' ngày' : 'tỷ giá HÔM NAY — xấp xỉ') + '): ' + newRows.length + ' dòng mới, LME Westmetall ' + Object.keys(wmLME).length + ' ngày, giữ ' + kept.length + ' dòng daily.');
 }
 
 // ═══ R3: THẨM ĐỊNH dữ liệu giá — chạy tay, xem Nhật ký thực thi ═══
