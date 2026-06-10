@@ -534,6 +534,23 @@ const App=()=>{
     if(!me){alert('❌ PIN không khớp người duyệt nào.');return null;}
     return me;
   },[approvers,loadApprovers,askPin]);
+
+  // ═══ GĐ3a: GIÁ THỊ TRƯỜNG (LME/SHFE/SMM + tỷ giá) — đọc tab MARKET_PRICES qua Apps Script ═══
+  const [marketData,setMarketData]=useState([]);   // rows mới nhất trước: {date,lme_usd,shfe_cny,smm_cny,smm_move,smm_usd,usd_vnd,cny_vnd}
+  const [marketErr,setMarketErr]=useState(null);
+  const loadMarket=useCallback(async()=>{
+    if(!gasConfig.url) return;
+    try{
+      const res=await fetch(`${gasConfig.url}?action=market&secret=${encodeURIComponent(gasConfig.secret||'')}&n=30`);
+      const d=await res.json();
+      if(d.ok){setMarketData(d.rows||[]);setMarketErr(null);}
+      else setMarketErr(d.error||'?');
+    }catch(e){setMarketErr(e.message);}
+  },[gasConfig.url,gasConfig.secret]);
+  useEffect(()=>{loadMarket();},[loadMarket]);
+  // Cấu hình so sánh CIF: premium (gia công + cước, USD/tấn) + ngưỡng cảnh báo %
+  const [marketCfg,setMarketCfg]=useState(()=>{try{return {premium:0,alertPct:3,...JSON.parse(localStorage.getItem('pakd_market_cfg')||'{}')};}catch(e){return {premium:0,alertPct:3};}});
+  const saveMarketCfg=(c)=>{setMarketCfg(c);try{localStorage.setItem('pakd_market_cfg',JSON.stringify(c));}catch(e){}};
   // Ghi danh sách người duyệt lên GitHub
   const saveApprovers=useCallback(async(list)=>{
     const payload={version:1,updatedAt:new Date().toISOString(),approvers:list};
@@ -2623,6 +2640,67 @@ URL.revokeObjectURL(url);
         {tab==='floor'&&(
           <div style={{flex:1,padding:'14px 18px',overflowY:'auto',background:bg1}}>
             <div style={{maxWidth:'1600px',margin:'0 auto'}}>
+
+              {/* GĐ3a: GIÁ THỊ TRƯỜNG — LME / SHFE / SMM + tỷ giá, tự kéo hằng ngày 12h */}
+              {gasConfig.url&&(()=>{
+                const mk=marketData[0]||null;
+                const mkPrev=marketData[1]||null;
+                const num=v=>{const f=parseFloat(v);return isNaN(f)?null:f;};
+                const smmUsd=mk?num(mk.smm_usd):null;
+                const bench=smmUsd!=null?smmUsd+(parseFloat(marketCfg.premium)||0):null;
+                const arrow=(cur,prev)=>{if(cur==null||prev==null)return '';return cur>prev?' ▲':cur<prev?' ▼':' =';};
+                const cifRows=bench!=null?updatedImportPrices.filter(u=>num(u.priceFC)>0).map(u=>{
+                  const cif=num(u.priceFC);const diff=(cif-bench)/bench*100;
+                  return {label:`${u.alloy} ${u.temper} ${u.minThick}-${u.maxThick}mm`,cif,diff};
+                }).sort((x,y)=>y.diff-x.diff):[];
+                const nOver=cifRows.filter(r=>r.diff>(parseFloat(marketCfg.alertPct)||3)).length;
+                return (
+                  <div className="card" style={{marginBottom:12,padding:'10px 14px',border:nOver>0?'2px solid #fca5a5':undefined}}>
+                    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',flexWrap:'wrap',gap:8}}>
+                      <div style={{fontWeight:900,fontSize:'.85rem',color:'#0f172a'}}>📈 Giá thị trường {mk?<span style={{fontSize:'.66rem',color:'#64748b',fontWeight:700}}>· {mk.date} (tự kéo 12h trưa)</span>:null}</div>
+                      <div style={{display:'flex',gap:6,alignItems:'center',fontSize:'.66rem',fontWeight:700,color:'#475569'}}>
+                        Premium <input className="inp inp-xs" style={{width:62}} type="number" value={marketCfg.premium} onChange={e=>saveMarketCfg({...marketCfg,premium:e.target.value})} title="Phí gia công tấm/cuộn + cước về VN cộng vào giá SMM thỏi (USD/tấn)"/> $/t
+                        · Ngưỡng <input className="inp inp-xs" style={{width:44}} type="number" value={marketCfg.alertPct} onChange={e=>saveMarketCfg({...marketCfg,alertPct:e.target.value})}/> %
+                        <button className="btn btn-ghost btn-sm" onClick={loadMarket} style={{padding:'1px 7px',fontSize:'.64rem'}}><Ic.Refresh/> Tải lại</button>
+                      </div>
+                    </div>
+                    {!mk?(
+                      <div style={{fontSize:'.7rem',color:'#b45309',fontWeight:700,marginTop:6}}>{marketErr?`⚠ Lỗi đọc giá: ${marketErr}`:'⚠ Chưa có dữ liệu — trong Apps Script chạy tay hàm fetchMarketPrices 1 lần (sau đó tự chạy 12h trưa hằng ngày).'}</div>
+                    ):(
+                      <>
+                        <div style={{display:'flex',gap:10,flexWrap:'wrap',marginTop:8}}>
+                          {[
+                            {l:'LME cash',v:num(mk.lme_usd),u:'$/t',p:mkPrev?num(mkPrev.lme_usd):null},
+                            {l:'SHFE',v:num(mk.shfe_cny),u:'¥/t',p:mkPrev?num(mkPrev.shfe_cny):null},
+                            {l:'SMM A00',v:num(mk.smm_cny),u:'¥/t',p:mkPrev?num(mkPrev.smm_cny):null},
+                            {l:'SMM quy đổi',v:smmUsd,u:'$/t',p:mkPrev?num(mkPrev.smm_usd):null},
+                            {l:'USD/VND',v:num(mk.usd_vnd),u:'',p:mkPrev?num(mkPrev.usd_vnd):null},
+                            {l:'CNY/VND',v:num(mk.cny_vnd),u:'',p:mkPrev?num(mkPrev.cny_vnd):null},
+                          ].map((b,i)=>(
+                            <div key={i} style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:6,padding:'5px 10px',minWidth:104}}>
+                              <div style={{fontSize:'.6rem',fontWeight:800,color:'#64748b'}}>{b.l}</div>
+                              <div className="mono" style={{fontSize:'.84rem',fontWeight:900,color:b.p!=null&&b.v!=null?(b.v>b.p?'#dc2626':b.v<b.p?'#16a34a':'#0f172a'):'#0f172a'}}>{b.v!=null?fv(b.v):'—'}{b.u?` ${b.u}`:''}<span style={{fontSize:'.62rem'}}>{arrow(b.v,b.p)}</span></div>
+                            </div>
+                          ))}
+                        </div>
+                        {bench!=null&&cifRows.length>0&&(
+                          <div style={{marginTop:8,borderTop:'1px dashed #e2e8f0',paddingTop:7}}>
+                            <span style={{fontSize:'.66rem',fontWeight:800,color:nOver>0?'#b91c1c':'#475569'}}>
+                              {nOver>0?`🔴 ${nOver} giá CIF chào cao hơn thị trường >${marketCfg.alertPct}%`:'✓ Giá CIF chào đang trong vùng hợp lý so với SMM quy đổi + premium'}
+                              <span style={{fontWeight:700,color:'#64748b'}}> (chuẩn so sánh: {fv(bench)} $/t)</span>
+                            </span>
+                            <div style={{display:'flex',gap:6,flexWrap:'wrap',marginTop:5}}>
+                              {cifRows.slice(0,8).map((r,i)=>(
+                                <span key={i} className="mono" style={{fontSize:'.62rem',fontWeight:800,borderRadius:4,padding:'2px 7px',background:r.diff>(parseFloat(marketCfg.alertPct)||3)?'#fee2e2':'#f0fdf4',color:r.diff>(parseFloat(marketCfg.alertPct)||3)?'#b91c1c':'#15803d'}}>{r.label}: {fv(r.cif)}$ ({r.diff>=0?'+':''}{r.diff.toFixed(1)}%)</span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                );
+              })()}
 
               {/* HEADER + VIEWS */}
               <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:12}}>

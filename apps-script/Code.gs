@@ -87,6 +87,11 @@ function doPost(e){
     if (body.action === 'ping') return json_({ ok: true, msg: 'PAKD Apps Script sẵn sàng' });
     if (body.action === 'markBuyReqDone')    return json_(markBuyReqDone_(body.payload || {}, by));
     if (body.action === 'updatePODelivered') return json_(updatePODelivered_(body.payload || {}, by));
+    if (body.action === 'storeMarket'){ // GĐ3a plan B: GitHub Actions kéo giá rồi đẩy vào đây
+      const p = body.payload || {};
+      const n = x => { const f = parseFloat(x); return isNaN(f) ? null : f; };
+      return json_(writeMarketRow_({ lme: n(p.lme), shfe: n(p.shfe), smm: n(p.smm), smmMove: n(p.smmMove), usd: n(p.usd), cny: n(p.cny) }));
+    }
     return json_({ ok: false, error: 'Action không hợp lệ: ' + body.action });
   } catch (err){
     return json_({ ok: false, error: String(err && err.message || err) });
@@ -165,9 +170,12 @@ function skuLabel_(o){ return [o.alloy, o.temper, o.thickness + 'x' + o.width + 
 
 // ───────────────────────── CẢNH BÁO SÁNG 8H ─────────────────────────
 function setupTriggers(){
-  ScriptApp.getProjectTriggers().forEach(t => { if (t.getHandlerFunction() === 'checkDailyAlerts') ScriptApp.deleteTrigger(t); });
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (['checkDailyAlerts','fetchMarketPrices'].indexOf(t.getHandlerFunction()) >= 0) ScriptApp.deleteTrigger(t);
+  });
   ScriptApp.newTrigger('checkDailyAlerts').timeBased().everyDays(1).atHour(8).create();
-  Logger.log('✓ Đã tạo lịch chạy checkDailyAlerts mỗi ngày ~8h sáng');
+  ScriptApp.newTrigger('fetchMarketPrices').timeBased().everyDays(1).atHour(12).create(); // GĐ3a: sau khi SMM công bố ~10h30 VN
+  Logger.log('✓ Đã tạo lịch: checkDailyAlerts ~8h sáng, fetchMarketPrices ~12h trưa');
 }
 
 function checkDailyAlerts(){
@@ -175,6 +183,7 @@ function checkDailyAlerts(){
   try { alertCashflow_(alerts); }   catch (e){ alerts.push('⚠ Lỗi đọc dòng tiền: ' + e.message); }
   try { alertLowStock_(alerts); }   catch (e){ alerts.push('⚠ Lỗi đọc tồn kho: ' + e.message); }
   try { alertPendingPA_(alerts); }  catch (e){ alerts.push('⚠ Lỗi đọc PA GitHub: ' + e.message); }
+  try { alertCIFvsMarket_(alerts); } catch (e){ alerts.push('⚠ Lỗi so giá CIF/thị trường: ' + e.message); }
 
   if (alerts.length === 0){ Logger.log('Không có cảnh báo — không gửi email.'); return; }
   const to = props_().getProperty('ALERT_EMAILS');
@@ -275,4 +284,202 @@ function alertPendingPA_(alerts){
     } catch (e){}
   });
   if (pend.length) alerts.push('⏳ <b>' + pend.length + ' PA mua chờ duyệt quá 24h</b>:<br>• ' + pend.join('<br>• '));
+}
+
+// ═══════════════════ GĐ3a: GIÁ THỊ TRƯỜNG (LME / SHFE / SMM) + TỶ GIÁ ═══════════════════
+// Nguồn chính: worthwillaluminium.com/api/price/{smm|lme|shfe} (miễn phí, JSON sạch).
+// Dự phòng: LME → westmetall.com ; SHFE → shfe.com.cn .dat. SMM miễn phí chỉ có nguồn chính.
+// Tỷ giá USD/CNY: XML công khai Vietcombank.
+// Script properties thêm (tùy chọn): CIF_PREMIUM_USD (phí gia công+cước cộng vào SMM ingot, mặc định 0),
+//                                    CIF_ALERT_PCT (ngưỡng cảnh báo %, mặc định 3).
+const MARKET_SHEET = 'MARKET_PRICES';
+const WW_API = 'https://www.worthwillaluminium.com/api/price/';
+
+function fetchJson_(url){
+  try {
+    const txt = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } }).getContentText();
+    return JSON.parse(txt);
+  } catch (e){ return null; }
+}
+function wwCurrent_(kind){
+  const r = fetchJson_(WW_API + kind);
+  return (r && r.code === 200 && r.data && r.data.current) ? r.data.current : null;
+}
+// Tỷ giá USD/VND + CNY/VND. SỬA 10/06: portal Vietcombank TREO ~6 phút khi gọi từ IP Google
+// (testMarketSources đo được 359s) → chuyển sang GOOGLEFINANCE (nội bộ Google, không thể bị chặn)
+// qua sheet phụ ẩn FX_HELPER; dự phòng open.er-api.com. Lưu ý: tỷ giá GIỮA THỊ TRƯỜNG, lệch nhẹ giá Transfer VCB.
+function fetchFxRates_(){
+  // 1) GOOGLEFINANCE qua sheet phụ ẩn
+  try {
+    const ss = ss_();
+    let sh = ss.getSheetByName('FX_HELPER');
+    if (!sh){ sh = ss.insertSheet('FX_HELPER'); try { sh.hideSheet(); } catch (e){} }
+    sh.getRange('A1').setFormula('=GOOGLEFINANCE("CURRENCY:USDVND")');
+    sh.getRange('A2').setFormula('=GOOGLEFINANCE("CURRENCY:CNYVND")');
+    sh.getRange('B1').setValue('VND/USD (GOOGLEFINANCE)'); sh.getRange('B2').setValue('VND/CNY (GOOGLEFINANCE)');
+    SpreadsheetApp.flush();
+    for (var i = 0; i < 10; i++){
+      const usd = parseFloat(sh.getRange('A1').getValue());
+      const cny = parseFloat(sh.getRange('A2').getValue());
+      if (usd > 0 && cny > 0) return { usd: usd, cny: cny, src: 'GOOGLEFINANCE' };
+      Utilities.sleep(1000); // chờ công thức tính xong
+    }
+  } catch (e){}
+  // 2) Dự phòng: open.er-api.com (miễn phí, thân thiện IP Google)
+  try {
+    const r = fetchJson_('https://open.er-api.com/v6/latest/USD');
+    if (r && r.rates && r.rates.VND){
+      return { usd: r.rates.VND, cny: r.rates.CNY ? r.rates.VND / r.rates.CNY : null, src: 'er-api' };
+    }
+  } catch (e){}
+  return { usd: null, cny: null, src: null };
+}
+// Dự phòng LME: bảng westmetall (cash settlement mới nhất, USD/tấn)
+function fetchLMEFallback_(){
+  try {
+    const html = UrlFetchApp.fetch('https://www.westmetall.com/en/markdaten.php?action=table&field=LME_Al_cash',
+      { muteHttpExceptions: true, headers: { 'User-Agent': 'Mozilla/5.0' } }).getContentText();
+    const m = html.match(/<td[^>]*>\s*\d{2}\.\s*\w+\s*\d{4}\s*<\/td>\s*<td[^>]*>\s*([\d,]+\.?\d*)\s*<\/td>/);
+    return m ? parseFloat(m[1].replace(/,/g, '')) : null;
+  } catch (e){ return null; }
+}
+// Dự phòng SHFE: file .dat công khai (close của hợp đồng nhôm gần nhất, CNY/tấn)
+function fetchSHFEFallback_(){
+  try {
+    for (var back = 0; back < 2; back++){ // chỉ lùi 2 ngày — tránh treo lâu
+      const d = new Date(Date.now() - back * 86400000);
+      const ds = Utilities.formatDate(d, 'GMT+8', 'yyyyMMdd');
+      const r = fetchJson_('https://www.shfe.com.cn/data/tradedata/future/dailydata/kx' + ds + '.dat');
+      if (!r || !r.o_curinstrument) continue;
+      const al = r.o_curinstrument.filter(x => String(x.PRODUCTID).indexOf('al_f') === 0 && x.CLOSEPRICE > 0);
+      if (al.length) return parseFloat(al[0].CLOSEPRICE);
+    }
+  } catch (e){}
+  return null;
+}
+
+// Chạy hằng ngày ~12h trưa VN (sau khi SMM công bố 10:30 VN). Ghi/cập nhật 1 dòng/ngày.
+// CHỐNG TIMEOUT (sửa 10/06): một số nguồn có thể TREO khi gọi từ máy chủ Google (chặn IP datacenter),
+// mỗi request treo ~60s → quá giới hạn 6 phút. Giải pháp: quỹ thời gian — hết quỹ thì BỎ QUA nguồn
+// còn lại và ghi những gì đã lấy được. Chạy testMarketSources để biết đích danh nguồn nào treo.
+function fetchMarketPrices(){
+  const t0 = Date.now();
+  const leftMs = () => 270000 - (Date.now() - t0); // quỹ 4.5 phút (chừa 1.5 phút an toàn)
+  const step = (name, fn) => {
+    if (leftMs() < 75000){ Logger.log('⏭ BỎ QUA ' + name + ' — hết quỹ thời gian'); return null; }
+    const s = Date.now();
+    try {
+      const v = fn();
+      Logger.log((v != null ? '✓ ' : '✗ ') + name + ' (' + Math.round((Date.now() - s) / 1000) + 's)');
+      return v;
+    } catch (e){ Logger.log('✗ ' + name + ' lỗi: ' + e.message + ' (' + Math.round((Date.now() - s) / 1000) + 's)'); return null; }
+  };
+  const fx   = step('Tỷ giá (GOOGLEFINANCE)', fetchFxRates_) || { usd: null, cny: null };
+  const smm  = step('SMM (worthwill)',  function(){ return wwCurrent_('smm'); });
+  const lme  = step('LME (worthwill)',  function(){ return wwCurrent_('lme'); });
+  const shfe = step('SHFE (worthwill)', function(){ return wwCurrent_('shfe'); });
+  let lmeCash   = lme  ? parseFloat(lme.average || lme.end) : null;
+  let shfeClose = shfe ? parseFloat(shfe.close_price || shfe.settlement_price) : null;
+  if (lmeCash == null)   lmeCash   = step('LME dự phòng (westmetall)',  fetchLMEFallback_);
+  if (shfeClose == null) shfeClose = step('SHFE dự phòng (shfe.com.cn)', fetchSHFEFallback_);
+  const smmAvg  = smm ? parseFloat(smm.average)   : null;
+  const smmMove = smm ? parseFloat(smm.move || 0) : null;
+  writeMarketRow_({ lme: lmeCash, shfe: shfeClose, smm: smmAvg, smmMove: smmMove, usd: fx.usd, cny: fx.cny });
+  Logger.log('KẾT QUẢ: LME=' + lmeCash + ' SHFE=' + shfeClose + ' SMM=' + smmAvg + ' USD=' + fx.usd + ' CNY=' + fx.cny + ' — tổng ' + Math.round((Date.now() - t0) / 1000) + 's');
+}
+
+// Ghi/cập nhật dòng giá của HÔM NAY vào tab MARKET_PRICES (giữ giá trị cũ nếu giá mới null)
+function writeMarketRow_(v){
+  const ss = ss_();
+  let sh = ss.getSheetByName(MARKET_SHEET);
+  if (!sh){
+    sh = ss.insertSheet(MARKET_SHEET);
+    sh.appendRow(['date', 'lme_usd', 'shfe_cny', 'smm_cny', 'smm_move', 'smm_usd', 'usd_vnd', 'cny_vnd', 'fetched_at']);
+    sh.setFrozenRows(1);
+  }
+  const smmUsd = (v.smm != null && v.usd && v.cny) ? Math.round(v.smm * v.cny / v.usd * 10) / 10 : null;
+  const today = Utilities.formatDate(new Date(), 'GMT+7', 'yyyy-MM-dd');
+  let row = [today, v.lme, v.shfe, v.smm, v.smmMove, smmUsd, v.usd, v.cny, Utilities.formatDate(new Date(), 'GMT+7', 'HH:mm')];
+  const last = sh.getLastRow();
+  if (last > 1 && String(sh.getRange(last, 1).getValue()).slice(0, 10) === today){
+    // cùng ngày → ghi đè, nhưng KHÔNG xóa giá trị cũ bằng null (nguồn tạm chết vẫn giữ số buổi trước)
+    const old = sh.getRange(last, 1, 1, row.length).getValues()[0];
+    row = row.map(function(x, i){ return (x == null || x === '') ? old[i] : x; });
+    sh.getRange(last, 1, 1, row.length).setValues([row]);
+  } else {
+    sh.appendRow(row);
+  }
+  return { ok: true, msg: 'Đã ghi giá ngày ' + today };
+}
+
+// CHẨN ĐOÁN: chạy hàm này để biết nguồn nào sống/chết/treo từ máy chủ Google (xem Nhật ký thực thi)
+function testMarketSources(){
+  const tests = [
+    ['Tỷ giá GOOGLEFINANCE', function(){ const r = fetchFxRates_(); return r && r.usd ? 'USD=' + r.usd + ' CNY=' + Math.round(r.cny) + ' (' + r.src + ')' : null; }],
+    ['SMM (worthwill)',     function(){ const r = wwCurrent_('smm');  return r ? r.date + ' avg=' + r.average : null; }],
+    ['LME (worthwill)',     function(){ const r = wwCurrent_('lme');  return r ? r.date + ' avg=' + r.average : null; }],
+    ['SHFE (worthwill)',    function(){ const r = wwCurrent_('shfe'); return r ? r.date + ' close=' + r.close_price : null; }],
+    ['LME westmetall',      function(){ return fetchLMEFallback_(); }],
+    ['SHFE shfe.com.cn',    function(){ return fetchSHFEFallback_(); }],
+  ];
+  tests.forEach(function(tt){
+    const s = Date.now();
+    try {
+      const v = tt[1]();
+      Logger.log((v != null ? '✓ SỐNG  ' : '✗ KHÔNG DỮ LIỆU  ') + tt[0] + ' → ' + v + ' (' + Math.round((Date.now() - s) / 1000) + 's)');
+    } catch (e){
+      Logger.log('✗ LỖI  ' + tt[0] + ': ' + e.message + ' (' + Math.round((Date.now() - s) / 1000) + 's)');
+    }
+  });
+}
+
+// App đọc giá: GET <url>?action=market&secret=...  → {ok, rows:[{date,lme_usd,...}]} (mới nhất TRƯỚC)
+function doGet(e){
+  const p = (e && e.parameter) || {};
+  if (p.secret !== props_().getProperty('SECRET')) return json_({ ok: false, error: 'Sai mã bí mật' });
+  if (p.action === 'market'){
+    const sh = ss_().getSheetByName(MARKET_SHEET);
+    if (!sh || sh.getLastRow() < 2) return json_({ ok: true, rows: [] });
+    const data = sh.getDataRange().getValues();
+    const H = data[0];
+    const n = Math.min(parseInt(p.n) || 30, data.length - 1);
+    const rows = data.slice(-n).reverse().map(r => { const o = {}; H.forEach((h, i) => o[h] = r[i] instanceof Date ? Utilities.formatDate(r[i], 'GMT+7', 'yyyy-MM-dd') : r[i]); return o; });
+    return json_({ ok: true, rows: rows });
+  }
+  return json_({ ok: false, error: 'Action không hợp lệ' });
+}
+
+// 4) CIF chào cao hơn thị trường: so giá CIF mới nhất (sheet Giá nhập cập nhật) với SMM quy đổi + premium
+const GID_UPDATED_IMPORT = 1371908903;
+function alertCIFvsMarket_(alerts){
+  const sh = ss_().getSheetByName(MARKET_SHEET);
+  if (!sh || sh.getLastRow() < 2) return;
+  const H = sh.getDataRange().getValues()[0];
+  const lastRow = sh.getRange(sh.getLastRow(), 1, 1, H.length).getValues()[0];
+  const get = name => { const i = H.indexOf(name); return i >= 0 ? parseFloat(lastRow[i]) : NaN; };
+  const smmUsd = get('smm_usd');
+  if (!smmUsd || isNaN(smmUsd)) return;
+  const premium = parseFloat(props_().getProperty('CIF_PREMIUM_USD')) || 0;
+  const pct = parseFloat(props_().getProperty('CIF_ALERT_PCT')) || 3;
+  const benchmark = smmUsd + premium;
+
+  const ui = sheetByGid_(GID_UPDATED_IMPORT).getDataRange().getValues();
+  const Hu = ui[0];
+  const cDate = colIdx_(Hu, ['updatedate', 'update date', 'ngaycapnhat']),
+        cA = colIdx_(Hu, ['alloy', 'mac']), cT = colIdx_(Hu, ['temper']),
+        cF = colIdx_(Hu, ['pricefc', 'price fc', 'giacif']);
+  if (cF < 0) return;
+  // lấy các dòng thuộc ngày cập nhật MỚI NHẤT
+  let latest = '';
+  for (var i = 1; i < ui.length; i++){ const d = String(ui[i][cDate] || ''); if (d > latest) latest = d; }
+  const over = [];
+  for (var r = 1; r < ui.length; r++){
+    const row = ui[r];
+    if (String(row[cDate] || '') !== latest) continue;
+    const cif = parseFloat(row[cF]) || 0; if (cif <= 0) continue;
+    const diff = (cif - benchmark) / benchmark * 100;
+    if (diff > pct) over.push((row[cA] || '?') + ' ' + (row[cT] || '') + ': CIF chào ' + cif + ' $/t cao hơn SMM quy đổi+premium (' + Math.round(benchmark) + ' $/t) <b>' + diff.toFixed(1) + '%</b>');
+  }
+  if (over.length) alerts.push('📈 <b>' + over.length + ' giá CIF chào cao hơn thị trường &gt;' + pct + '%</b> (SMM ' + Math.round(smmUsd) + ' $/t + premium ' + premium + '):<br>• ' + over.join('<br>• '));
 }
